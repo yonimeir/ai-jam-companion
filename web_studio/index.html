@@ -419,27 +419,70 @@
     }
 
     // --- Backend Detection ---
-    async function checkBackend() {
-      if (window.location.protocol === "file:") return;
-      try {
-        const res = await fetch("/api/health");
-        if (res.ok) {
-          backendConnected = true;
-          const badge = document.getElementById("backendBadge");
-          badge.className = "text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
-          badge.textContent = "🟢 Python Real-Time Engine";
-          document.getElementById("exportMidiBtn").classList.remove("hidden");
-          document.getElementById("exportWavBtn").classList.remove("hidden");
+    let backendReconnectTimer = null;
+    async function checkBackend({ retries = 3, delayMs = 2000, loadSongMap = true } = {}) {
+      if (window.location.protocol === "file:") return false;
+      const badge = document.getElementById("backendBadge");
 
-          // Fetch real demo song map
-          const mapRes = await fetch("/api/song-map/current");
-          if (mapRes.ok) {
-            const parsed = await mapRes.json();
-            loadBackendSongMap(parsed);
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          if (attempt > 0 && badge && !backendConnected) {
+            badge.className = "text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30";
+            badge.textContent = "⏳ מתחבר לשרת...";
           }
+          const res = await fetch("/api/health", { cache: "no-store" });
+          if (res.ok) {
+            const wasConnected = backendConnected;
+            backendConnected = true;
+            if (backendReconnectTimer) {
+              clearInterval(backendReconnectTimer);
+              backendReconnectTimer = null;
+            }
+            if (badge) {
+              badge.className = "text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
+              badge.textContent = "🟢 Python Real-Time Engine";
+            }
+            document.getElementById("exportMidiBtn").classList.remove("hidden");
+            document.getElementById("exportWavBtn").classList.remove("hidden");
+
+            if (loadSongMap && !wasConnected) {
+              const mapRes = await fetch("/api/song-map/current", { cache: "no-store" });
+              if (mapRes.ok) {
+                const parsed = await mapRes.json();
+                loadBackendSongMap(parsed);
+              }
+            }
+            return true;
+          }
+        } catch (_) {}
+
+        if (attempt < retries) {
+          await new Promise(r => setTimeout(r, delayMs));
         }
-      } catch (_) {}
+      }
+
+      if (!backendConnected && badge) {
+        badge.className = "text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30";
+        badge.textContent = "🟡 Standalone Mode";
+      }
+      if (!backendReconnectTimer) {
+        backendReconnectTimer = setInterval(() => {
+          if (!backendConnected && document.visibilityState === "visible") {
+            checkBackend({ retries: 0, loadSongMap: true });
+          }
+        }, 10000);
+      }
+      return false;
     }
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && !backendConnected) {
+        checkBackend({ retries: 1, delayMs: 1500, loadSongMap: false });
+      }
+    });
+    window.addEventListener("online", () => {
+      if (!backendConnected) checkBackend({ retries: 2, delayMs: 1500, loadSongMap: false });
+    });
 
     function loadBackendSongMap(parsed) {
       if (!parsed || !parsed.metadata) return;
@@ -1333,8 +1376,16 @@
       document.getElementById("youtubeUrlInput").value = cleanUrl;
 
       if (!backendConnected) {
-        setYoutubeStatus("⚠️ הקישור נקלט, אך הורדה וניתוח של יוטיוב דורשים חיבור לשרת המקומי: הרץ python3 server.py ופתח דרך http://localhost:8000", "error");
-        return;
+        if (window.location.protocol === "file:") {
+          setYoutubeStatus("⚠️ הקישור נקלט, אך הורדה וניתוח של יוטיוב דורשים חיבור לשרת המקומי: הרץ python3 server.py ופתח דרך http://localhost:8000", "error");
+          return;
+        }
+        setYoutubeStatus("⏳ מעיר ומתחבר לשרת בענן...", "loading");
+        await checkBackend({ retries: 2, delayMs: 2500, loadSongMap: false });
+        if (!backendConnected) {
+          setYoutubeStatus("⚠️ השרת בענן כרגע אינו מגיב או מתעורר משינה — נסה שוב בעוד מספר שניות.", "error");
+          return;
+        }
       }
 
       const btn = document.getElementById("youtubeAnalyzeBtn");

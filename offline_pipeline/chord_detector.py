@@ -194,12 +194,42 @@ def _viterbi_decode_chords(
     return path
 
 
+def _chunked_onset_strength(
+    y: np.ndarray,
+    sr: int,
+    hop_length: int = 512,
+    chunk_frames: int = 860,
+    pad_frames: int = 44,
+) -> np.ndarray:
+    total_frames = 1 + len(y) // hop_length
+    if total_frames <= chunk_frames:
+        return librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length, aggregate=np.median)
+
+    out = np.zeros(total_frames, dtype=np.float32)
+    for f_start in range(0, total_frames, chunk_frames):
+        f_end = min(total_frames, f_start + chunk_frames)
+        win_f_start = max(0, f_end - chunk_frames) if (f_end - f_start) < chunk_frames else f_start
+        ctx_f_start = max(0, win_f_start - pad_frames)
+        ctx_f_end = min(total_frames, f_end + pad_frames)
+        s_start = ctx_f_start * hop_length
+        s_end = min(len(y), ctx_f_end * hop_length)
+        env = librosa.onset.onset_strength(
+            y=y[s_start:s_end], sr=sr, hop_length=hop_length, aggregate=np.median
+        )
+        off = f_start - ctx_f_start
+        n_take = min(f_end - f_start, max(0, len(env) - off))
+        if n_take > 0:
+            out[f_start:f_start + n_take] = env[off:off + n_take]
+        del env
+    return out
+
+
 def estimate_accurate_bpm(y: np.ndarray, sr: int) -> Tuple[float, np.ndarray]:
     """
     Estimates accurate tempo and beat frames using onset envelope autocorrelation
     to avoid default 120 BPM bias on sparse/ballad tracks.
     """
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
+    onset_env = _chunked_onset_strength(y=y, sr=sr)
     # Estimate tempo with broad prior across 55..170 BPM
     tempo_candidates = librosa.feature.tempo(
         onset_envelope=onset_env,
@@ -226,6 +256,80 @@ def estimate_accurate_bpm(y: np.ndarray, sr: int) -> Tuple[float, np.ndarray]:
     return bpm_val, beat_frames
 
 
+def chunked_hpss_harmonic(
+    y: np.ndarray,
+    sr: int,
+    chunk_sec: float = 10.0,
+    pad_sec: float = 1.0,
+) -> np.ndarray:
+    """
+    Computes harmonic component via librosa.effects.hpss in bounded time chunks
+    to avoid ~800MB peak spectrogram allocations on 3-5 minute songs (512MB RAM limit).
+    """
+    n = len(y)
+    chunk_samples = int(chunk_sec * sr)
+    if n <= chunk_samples or chunk_samples <= 0:
+        y_h, _ = librosa.effects.hpss(y)
+        return y_h.astype(np.float32, copy=False)
+
+    pad_samples = int(pad_sec * sr)
+    out = np.empty(n, dtype=np.float32)
+    for start in range(0, n, chunk_samples):
+        end = min(n, start + chunk_samples)
+        ctx_start = max(0, start - pad_samples)
+        ctx_end = min(n, end + pad_samples)
+        y_h_chunk, _ = librosa.effects.hpss(y[ctx_start:ctx_end])
+        left = start - ctx_start
+        out[start:end] = y_h_chunk[left:left + (end - start)]
+        del y_h_chunk
+    return out
+
+
+def chunked_chroma_cqt(
+    y: np.ndarray,
+    sr: int,
+    hop_length: int = 512,
+    n_chroma: int = 12,
+    fmin: float = None,
+    n_octaves: int = 7,
+    chunk_frames: int = 430,
+    pad_frames: int = 44,
+) -> np.ndarray:
+    """
+    Computes librosa.feature.chroma_cqt in bounded frame windows (~10s) to keep
+    CQT filterbank/spectrogram memory small on long songs.
+    """
+    if fmin is None:
+        fmin = librosa.note_to_hz("C1")
+    total_frames = 1 + len(y) // hop_length
+    if total_frames <= chunk_frames:
+        return librosa.feature.chroma_cqt(
+            y=y, sr=sr, hop_length=hop_length, n_chroma=n_chroma, fmin=fmin, n_octaves=n_octaves
+        ).astype(np.float32, copy=False)
+
+    out = np.empty((n_chroma, total_frames), dtype=np.float32)
+    for f_start in range(0, total_frames, chunk_frames):
+        f_end = min(total_frames, f_start + chunk_frames)
+        win_f_start = max(0, f_end - chunk_frames) if (f_end - f_start) < chunk_frames else f_start
+        ctx_f_start = max(0, win_f_start - pad_frames)
+        ctx_f_end = min(total_frames, f_end + pad_frames)
+        s_start = ctx_f_start * hop_length
+        s_end = min(len(y), ctx_f_end * hop_length)
+        c = librosa.feature.chroma_cqt(
+            y=y[s_start:s_end],
+            sr=sr,
+            hop_length=hop_length,
+            n_chroma=n_chroma,
+            fmin=fmin,
+            n_octaves=n_octaves,
+        )
+        off = f_start - ctx_f_start
+        n_take = f_end - f_start
+        out[:, f_start:f_end] = c[:, off:off + n_take]
+        del c
+    return out
+
+
 def extract_chords_from_audio(
     y: np.ndarray,
     sr: int,
@@ -242,8 +346,8 @@ def extract_chords_from_audio(
         bpm: Estimated tempo (BPM)
         beat_times: Array of beat times in seconds
     """
-    # 1. Harmonic-Percussive separation
-    y_harmonic, _ = librosa.effects.hpss(y)
+    # 1. Harmonic-Percussive separation (chunked for 512MB RAM safety)
+    y_harmonic = chunked_hpss_harmonic(y, sr)
 
     # 2. Accurate Tempo & Beat Tracking
     bpm, beat_frames = estimate_accurate_bpm(y, sr)
@@ -269,19 +373,22 @@ def extract_chords_from_audio(
         beat_times = np.concatenate([np.array(prepended), beat_times])
         beat_frames = librosa.time_to_frames(beat_times, sr=sr)
 
-    # 3. Compute Full-Range & Bass-Weighted CQT Chromagrams
-    chroma_full = librosa.feature.chroma_cqt(
+    # 3. Compute Full-Range & Bass-Weighted CQT Chromagrams (chunked)
+    chroma_full = chunked_chroma_cqt(
         y=y_harmonic, sr=sr, n_chroma=12, fmin=librosa.note_to_hz("C2"), n_octaves=5
     )
-    chroma_bass = librosa.feature.chroma_cqt(
+    chroma_bass = chunked_chroma_cqt(
         y=y_harmonic, sr=sr, n_chroma=12, fmin=librosa.note_to_hz("C2"), n_octaves=2
     )
+    del y_harmonic
     min_frames = min(chroma_full.shape[1], chroma_bass.shape[1])
     # Combined chroma gives extra weight to bass root notes (helps distinguish C vs Am, F vs Dm)
     chroma_combined = 0.70 * chroma_full[:, :min_frames] + 0.30 * chroma_bass[:, :min_frames]
+    del chroma_full, chroma_bass
 
     # 4. Synchronize chroma with beat frames
     chroma_sync = librosa.util.sync(chroma_combined, beat_frames, aggregate=np.median)
+    del chroma_combined
     num_beats = chroma_sync.shape[1]
 
     # 5. Global key estimation & diatonic prior

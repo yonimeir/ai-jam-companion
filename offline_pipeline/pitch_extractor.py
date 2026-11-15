@@ -13,20 +13,22 @@ import librosa
 import scipy.ndimage
 
 
-def isolate_foreground_vocals(y: np.ndarray, sr: int) -> np.ndarray:
-    """
-    Separates non-repeating foreground vocal melody from repeating instrumental backing
-    using librosa REPET-SIM (Rafii & Pardo, 2012) and soft spectral masking.
-    """
-    S_full, phase = librosa.magphase(librosa.stft(y, n_fft=2048, hop_length=512))
+def _isolate_vocals_chunk(y_chunk: np.ndarray, sr: int) -> np.ndarray:
+    S_full, phase = librosa.magphase(librosa.stft(y_chunk, n_fft=2048, hop_length=512))
+    n_frames = S_full.shape[1]
+    width = int(librosa.time_to_frames(2.0, sr=sr, hop_length=512))
 
-    # Nearest-neighbor median filtering across similar frames isolates repeating background
-    S_filter = librosa.decompose.nn_filter(
-        S_full,
-        aggregate=np.median,
-        metric="cosine",
-        width=int(librosa.time_to_frames(2.0, sr=sr, hop_length=512))
-    )
+    if n_frames <= 2:
+        S_filter = S_full.copy()
+    else:
+        eff_width = min(width, max(1, (n_frames - 1) // 2))
+        S_filter = librosa.decompose.nn_filter(
+            S_full,
+            aggregate=np.median,
+            metric="cosine",
+            width=eff_width,
+        )
+
     S_filter = np.minimum(S_full, S_filter)
 
     # Soft mask favoring foreground (vocals)
@@ -37,6 +39,7 @@ def isolate_foreground_vocals(y: np.ndarray, sr: int) -> np.ndarray:
         margin_v * S_filter,
         power=power
     )
+    del S_filter
 
     # Zero out sub-130Hz bass frequencies in vocal mask to avoid bass/kick bleed
     freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
@@ -44,8 +47,97 @@ def isolate_foreground_vocals(y: np.ndarray, sr: int) -> np.ndarray:
     mask_v[freqs > 4200.0, :] *= 0.25
 
     S_foreground = mask_v * S_full
-    y_vocals = librosa.istft(S_foreground * phase, hop_length=512, length=len(y))
-    return y_vocals
+    del mask_v, S_full
+    S_complex = S_foreground * phase
+    del S_foreground, phase
+    y_vocals = librosa.istft(S_complex, hop_length=512, length=len(y_chunk))
+    del S_complex
+    return y_vocals.astype(np.float32, copy=False)
+
+
+def isolate_foreground_vocals(y: np.ndarray, sr: int, chunk_frames: int = 1200) -> np.ndarray:
+    """
+    Separates non-repeating foreground vocal melody from repeating instrumental backing
+    using librosa REPET-SIM (Rafii & Pardo, 2012) and soft spectral masking.
+    Processes STFT + nn_filter + softmask + ISTFT in bounded ~28s audio windows
+    (~1200 frames at sr=22050, hop=512) so peak RAM stays minimal on 512MB cloud tiers.
+    """
+    hop_length = 512
+    chunk_samples = max(hop_length * 4, chunk_frames * hop_length)
+    n = len(y)
+    if n <= chunk_samples:
+        return _isolate_vocals_chunk(y, sr)
+
+    pad_samples = int(1.0 * sr)
+    out = np.empty(n, dtype=np.float32)
+    for start in range(0, n, chunk_samples):
+        end = min(n, start + chunk_samples)
+        # Ensure trailing short chunk still gets full context window for REPET-SIM
+        win_start = max(0, end - chunk_samples) if (end - start) < chunk_samples else start
+        ctx_start = max(0, win_start - pad_samples)
+        ctx_end = min(n, end + pad_samples)
+        y_voc_chunk = _isolate_vocals_chunk(y[ctx_start:ctx_end], sr)
+        left = start - ctx_start
+        out[start:end] = y_voc_chunk[left:left + (end - start)]
+        del y_voc_chunk
+    return out
+
+
+def _chunked_pyin(
+    y: np.ndarray,
+    fmin: float,
+    fmax: float,
+    sr: int,
+    frame_length: int,
+    hop_length: int,
+    chunk_frames: int = 860,
+    pad_frames: int = 44,
+):
+    """
+    Runs librosa.pyin in bounded ~20s frame windows to avoid ~300MB+
+    Boltzmann/Viterbi allocations on 4-5 minute tracks (512MB RAM safety).
+    """
+    total_frames = 1 + len(y) // hop_length
+    if total_frames <= chunk_frames:
+        return librosa.pyin(
+            y,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+            fill_na=0.0,
+        )
+
+    f0_out = np.zeros(total_frames, dtype=np.float32)
+    voiced_flag_out = np.zeros(total_frames, dtype=bool)
+    voiced_probs_out = np.zeros(total_frames, dtype=np.float32)
+
+    for f_start in range(0, total_frames, chunk_frames):
+        f_end = min(total_frames, f_start + chunk_frames)
+        win_f_start = max(0, f_end - chunk_frames) if (f_end - f_start) < chunk_frames else f_start
+        ctx_f_start = max(0, win_f_start - pad_frames)
+        ctx_f_end = min(total_frames, f_end + pad_frames)
+        s_start = ctx_f_start * hop_length
+        s_end = min(len(y), ctx_f_end * hop_length)
+        f0_c, vf_c, vp_c = librosa.pyin(
+            y[s_start:s_end],
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+            fill_na=0.0,
+        )
+        off = f_start - ctx_f_start
+        n_take = min(f_end - f_start, max(0, len(f0_c) - off))
+        if n_take > 0:
+            f0_out[f_start:f_start + n_take] = np.nan_to_num(f0_c[off:off + n_take], nan=0.0)
+            voiced_flag_out[f_start:f_start + n_take] = vf_c[off:off + n_take]
+            voiced_probs_out[f_start:f_start + n_take] = np.nan_to_num(vp_c[off:off + n_take], nan=0.0)
+        del f0_c, vf_c, vp_c
+
+    return f0_out, voiced_flag_out, voiced_probs_out
 
 
 def extract_pitch_contour(
@@ -70,29 +162,36 @@ def extract_pitch_contour(
             rms_db: vocal energy level in decibels
     """
     # 1. Foreground vocal isolation (removes repeating piano/drums/bass)
+    from offline_pipeline.chord_detector import chunked_hpss_harmonic
     if isolate_vocals:
         y_vocal = isolate_foreground_vocals(y, sr)
-        y_harm, _ = librosa.effects.hpss(y_vocal)
+        if save_vocals_path:
+            import soundfile as sf
+            os.makedirs(os.path.dirname(os.path.abspath(save_vocals_path)), exist_ok=True)
+            peak = float(np.max(np.abs(y_vocal))) if len(y_vocal) > 0 else 0.0
+            y_save = (y_vocal / peak * 0.9) if peak > 1e-6 else y_vocal
+            sf.write(save_vocals_path, y_save.astype(np.float32), sr)
+            del y_save
+        y_harm = chunked_hpss_harmonic(y_vocal, sr)
+        del y_vocal
     else:
-        y_vocal = y
-        y_harm, _ = librosa.effects.hpss(y)
+        if save_vocals_path:
+            import soundfile as sf
+            os.makedirs(os.path.dirname(os.path.abspath(save_vocals_path)), exist_ok=True)
+            peak = float(np.max(np.abs(y))) if len(y) > 0 else 0.0
+            y_save = (y / peak * 0.9) if peak > 1e-6 else y
+            sf.write(save_vocals_path, y_save.astype(np.float32), sr)
+            del y_save
+        y_harm = chunked_hpss_harmonic(y, sr)
 
-    if save_vocals_path:
-        import soundfile as sf
-        os.makedirs(os.path.dirname(os.path.abspath(save_vocals_path)), exist_ok=True)
-        peak = float(np.max(np.abs(y_vocal))) if len(y_vocal) > 0 else 0.0
-        y_save = (y_vocal / peak * 0.9) if peak > 1e-6 else y_vocal
-        sf.write(save_vocals_path, y_save.astype(np.float32), sr)
-
-    # 2. Extract F0 using pYIN
-    f0, voiced_flag, voiced_probs = librosa.pyin(
+    # 2. Extract F0 using chunked pYIN
+    f0, voiced_flag, voiced_probs = _chunked_pyin(
         y_harm,
         fmin=fmin,
         fmax=fmax,
         sr=sr,
         frame_length=frame_length,
         hop_length=hop_length,
-        fill_na=0.0
     )
 
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
