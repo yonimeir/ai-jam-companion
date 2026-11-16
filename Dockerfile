@@ -7,7 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
-    nodejs \
+    curl \
+    ca-certificates \
+    unzip \
+    && curl -fsSL https://deno.land/install.sh | CI=1 DENO_INSTALL=/usr/local sh -s -- --no-modify-path \
+    && deno --version \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

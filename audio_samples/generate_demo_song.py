@@ -7,6 +7,7 @@ Outputs:
 """
 
 import os
+from typing import Optional
 import numpy as np
 import soundfile as sf
 
@@ -58,7 +59,9 @@ def generate_vocal_tone(freq: float, duration: float, sr: int, amplitude: float 
 def midi_to_freq(midi_num: int) -> float:
     return 440.0 * (2.0 ** ((midi_num - 69.0) / 12.0))
 
-def build_demo_song(output_dir: str = "/home/antigravity/ai_jam_companion/audio_samples"):
+def build_demo_song(output_dir: Optional[str] = None):
+    if output_dir is None:
+        output_dir = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(output_dir, exist_ok=True)
     sr = 22050
     bpm = 100.0

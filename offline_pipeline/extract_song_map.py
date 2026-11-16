@@ -6,13 +6,16 @@ and vocal pitch contour, and exports a rich JSON state map.
 """
 
 import argparse
+import base64
+import gc
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
-from typing import Dict, Any, Optional, Tuple
+import urllib.parse
+from typing import Dict, Any, List, Optional, Tuple
 
 # Add parent directory to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,6 +32,12 @@ DEFAULT_PLACEHOLDER_TITLES = {"", "Demo Song", "Analyzed Track", "Custom Song"}
 DEFAULT_PLACEHOLDER_ARTISTS = {"", "Unknown Artist", "AI Jam", "AI Jam User"}
 URL_EXTRACT_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
+YOUTUBE_CLIENT_CHAIN: List[Optional[List[str]]] = [
+    ["android_vr", "web_embedded", "tv"],
+    ["ios", "mweb", "web"],
+    None,  # Default yt-dlp behavior
+]
+
 
 def extract_media_url(raw_text: str) -> Optional[str]:
     """
@@ -44,10 +53,129 @@ def extract_media_url(raw_text: str) -> Optional[str]:
     return url
 
 
+def _is_youtube_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return (
+        host == "youtu.be"
+        or host.endswith(".youtu.be")
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtube-nocookie.com"
+        or host.endswith(".youtube-nocookie.com")
+    )
+
+
+def _resolve_cookies_file(output_dir: str) -> Optional[str]:
+    """
+    Resolves optional YouTube cookies from YTDLP_COOKIES_B64 (base64 Netscape cookies)
+    or YOUTUBE_COOKIES (raw Netscape cookie text or file path).
+    """
+    b64_cookies = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    if b64_cookies:
+        try:
+            decoded = base64.b64decode(b64_cookies).decode("utf-8", errors="replace")
+            if decoded.strip():
+                cookie_path = os.path.join(output_dir, "yt_cookies.txt")
+                with open(cookie_path, "w", encoding="utf-8") as f:
+                    f.write(decoded)
+                return cookie_path
+        except Exception as exc:
+            print(f"[!] Warning: failed to decode YTDLP_COOKIES_B64: {exc}", file=sys.stderr)
+
+    raw_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if raw_cookies:
+        if os.path.isfile(raw_cookies):
+            return raw_cookies
+        text = raw_cookies.replace("\\n", "\n") if ("\n" not in raw_cookies and "\\n" in raw_cookies) else raw_cookies
+        cookie_path = os.path.join(output_dir, "yt_cookies.txt")
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return cookie_path
+
+    return None
+
+
+def _check_youtube_oembed(url: str) -> Dict[str, Any]:
+    """
+    Checks YouTube oEmbed endpoint to distinguish between a deleted/private video
+    and a cloud-IP / geo / bot-check block when yt-dlp fails.
+    """
+    oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(url, safe='')}&format=json"
+    try:
+        import httpx
+        resp = httpx.get(oembed_url, timeout=5.0, follow_redirects=True)
+        status_code = resp.status_code
+        if status_code == 200:
+            data = resp.json()
+            return {
+                "status": "public",
+                "title": data.get("title"),
+                "author_name": data.get("author_name"),
+            }
+        if status_code in (401, 403):
+            return {"status": "private_or_restricted", "http_status": status_code}
+        if status_code in (400, 404):
+            return {"status": "not_found_or_deleted", "http_status": status_code}
+        return {"status": "unknown", "http_status": status_code}
+    except Exception as exc:
+        return {"status": "unknown", "error": str(exc)}
+
+
+def _format_youtube_failure_message(
+    url: str,
+    last_error: Optional[Exception],
+    has_cookies: bool,
+) -> str:
+    oembed = _check_youtube_oembed(url)
+    status = oembed.get("status")
+    err_str = str(last_error) if last_error else "שגיאה לא ידועה"
+
+    if status == "public":
+        title_note = f" (\"{oembed['title']}\")" if oembed.get("title") else ""
+        cookie_hint = (
+            "מומלץ לעדכן את ה-Cookies במשתנה הסביבה YTDLP_COOKIES_B64 / YOUTUBE_COOKIES, או להעלות קובץ MP3/WAV ישירות."
+            if has_cookies
+            else "מומלץ להגדיר YTDLP_COOKIES_B64 או YOUTUBE_COOKIES בשרת, או להעלות קובץ MP3/WAV ישירות."
+        )
+        return (
+            f"הסרטון קיים וזמין ביוטיוב{title_note}, אך יוטיוב חסם את ההורדה משרת הענן "
+            f"(חסימת מדינה / כתובת שרת ענן / אימות בוטים). {cookie_hint}"
+        )
+
+    if status == "private_or_restricted":
+        return (
+            "הסרטון ביוטיוב הוא פרטי, מוגבל גיל/גישה או חסום להטמעה, ולכן לא ניתן להוריד אותו מהשרת. "
+            "אפשר להוריד את האודיו במכשיר ולהעלות קובץ MP3/WAV ישירות."
+        )
+
+    if status == "not_found_or_deleted":
+        return "הסרטון לא נמצא ביוטיוב — ייתכן שנמחק, הפך לפרטי או שהקישור אינו תקין."
+
+    err_lower = err_str.lower()
+    if "private video" in err_lower or "members-only" in err_lower:
+        return "הסרטון ביוטיוב הוא פרטי או לחברים בלבד, ולכן לא ניתן להוריד אותו."
+    if "not available in your country" in err_lower or "geo" in err_lower:
+        return "הסרטון חסום במדינה של השרת (חסימת אזור). מומלץ להעלות קובץ MP3/WAV ישירות."
+    if "sign in" in err_lower or "bot" in err_lower or "cookies" in err_lower:
+        return (
+            "יוטיוב דורש אימות / Cookies משרת הענן (חסימת בוטים). "
+            "הגדר YTDLP_COOKIES_B64 / YOUTUBE_COOKIES או העלה קובץ MP3/WAV ישירות."
+        )
+
+    return (
+        "הורדת האודיו מיוטיוב נכשלה בכל הלקוחות (ייתכן שהסרטון פרטי/מחוק או שקיימת חסימת מדינה/שרת ענן). "
+        f"פרטי שגיאה: {err_str}"
+    )
+
+
 def download_audio_with_metadata(url: str, output_dir: str) -> Tuple[str, Dict[str, Any]]:
     """
     Download audio from YouTube / YouTube Music / web URL using yt-dlp
-    and return (wav_path, metadata_dict).
+    with a multi-client fallback chain, EJS remote components, geo-bypass,
+    optional cookies from environment variables, and YouTube oEmbed diagnostics.
     """
     try:
         import yt_dlp
@@ -55,46 +183,72 @@ def download_audio_with_metadata(url: str, output_dir: str) -> Tuple[str, Dict[s
         raise RuntimeError("yt-dlp is required for downloading audio from URLs. Please install yt-dlp.")
 
     clean_url = extract_media_url(url) or url.strip()
-    out_tmpl = os.path.join(output_dir, "downloaded_audio.%(ext)s")
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": out_tmpl,
-        "noplaylist": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-            "preferredquality": "192",
-        }],
-        "quiet": True,
-        "no_warnings": True,
-    }
+    is_yt = _is_youtube_url(clean_url)
+    cookie_file = _resolve_cookies_file(output_dir)
+    attempts: List[Optional[List[str]]] = YOUTUBE_CLIENT_CHAIN if is_yt else [None]
 
-    media_meta: Dict[str, Any] = {"source_url": clean_url}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(clean_url, download=True)
-        if isinstance(info, dict):
-            # Handle single-entry playlist wrapper if yt-dlp returns entries
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            media_meta["title"] = info.get("track") or info.get("title")
-            media_meta["artist"] = (
-                info.get("artist")
-                or info.get("creator")
-                or info.get("uploader")
-                or info.get("channel")
-            )
-            media_meta["source_url"] = info.get("webpage_url") or clean_url
-            media_meta["video_id"] = info.get("id")
+    last_error: Optional[Exception] = None
+    for idx, clients in enumerate(attempts):
+        attempt_dir = os.path.join(output_dir, f"attempt_{idx}")
+        os.makedirs(attempt_dir, exist_ok=True)
+        out_tmpl = os.path.join(attempt_dir, "downloaded_audio.%(ext)s")
 
-    expected_wav = os.path.join(output_dir, "downloaded_audio.wav")
-    if os.path.exists(expected_wav):
-        return expected_wav, media_meta
+        ydl_opts: Dict[str, Any] = {
+            "format": "bestaudio/best",
+            "outtmpl": out_tmpl,
+            "noplaylist": True,
+            "geo_bypass": True,
+            "remote_components": ["ejs:github"],
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+                "preferredquality": "192",
+            }],
+            "quiet": True,
+            "no_warnings": True,
+        }
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
+        if clients is not None:
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
 
-    files = [os.path.join(output_dir, f) for f in os.listdir(output_dir)]
-    if files:
-        return files[0], media_meta
+        try:
+            media_meta: Dict[str, Any] = {"source_url": clean_url}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(clean_url, download=True)
+                if isinstance(info, dict):
+                    # Handle single-entry playlist wrapper if yt-dlp returns entries
+                    if "entries" in info and info["entries"]:
+                        info = info["entries"][0]
+                    media_meta["title"] = info.get("track") or info.get("title")
+                    media_meta["artist"] = (
+                        info.get("artist")
+                        or info.get("creator")
+                        or info.get("uploader")
+                        or info.get("channel")
+                    )
+                    media_meta["source_url"] = info.get("webpage_url") or clean_url
+                    media_meta["video_id"] = info.get("id")
 
-    raise FileNotFoundError("Failed to locate downloaded audio file.")
+            expected_wav = os.path.join(attempt_dir, "downloaded_audio.wav")
+            if os.path.exists(expected_wav):
+                return expected_wav, media_meta
+
+            files = [os.path.join(attempt_dir, f) for f in os.listdir(attempt_dir)]
+            if files:
+                return files[0], media_meta
+
+            raise FileNotFoundError("Failed to locate downloaded audio file.")
+        except Exception as exc:
+            last_error = exc
+            client_label = ",".join(clients) if clients else "default"
+            print(f"[!] yt-dlp attempt ({client_label}) failed: {exc}", file=sys.stderr)
+
+    if is_yt:
+        raise RuntimeError(
+            _format_youtube_failure_message(clean_url, last_error, has_cookies=bool(cookie_file))
+        )
+    raise RuntimeError(f"הורדת האודיו מהקישור נכשלה: {last_error}")
 
 
 def download_audio_from_url(url: str, output_dir: str) -> str:
@@ -143,16 +297,20 @@ def generate_song_map(
         # 1. Harmonic and Chord Analysis
         print("[*] Extracting harmony, BPM, and chord sequence...")
         chords_list, bpm, beat_times = extract_chords_from_audio(y, sr)
+        gc.collect()
         print(f"[✓] Detected BPM: {bpm:.1f}, Chords count: {len(chords_list)}")
 
         # 2. Song Structural Segmentation
         print("[*] Segmenting song structure (Intro, Verse, Chorus, Outro)...")
         sections = segment_song_structure(y, sr, beat_times)
+        gc.collect()
         print(f"[✓] Detected {len(sections)} sections: {[s['name'] for s in sections]}")
 
         # 3. Vocal Pitch Contour (F0 reference anchor)
         print("[*] Extracting vocal pitch curve and energy contour via pYIN...")
         vocal_anchor = extract_pitch_contour(y, sr, save_vocals_path=save_vocals_path)
+        del y
+        gc.collect()
         voiced_count = sum(1 for p in vocal_anchor["f0_hz"] if p > 0)
         print(f"[✓] Extracted {vocal_anchor['frame_count']} frames ({voiced_count} voiced frames)")
 
