@@ -7,7 +7,6 @@ using recurrence matrix, spectral novelty, and agglomerative clustering.
 from typing import List, Dict, Any
 import numpy as np
 import librosa
-from offline_pipeline.chord_detector import chunked_chroma_cqt
 
 def segment_song_structure(
     y: np.ndarray,
@@ -35,15 +34,17 @@ def segment_song_structure(
         
     try:
         # Extract features for structural boundary detection
-        # Combine MFCC (timbre) and Chroma (harmony)
+        # Combine MFCC (timbre) and Chroma STFT (harmony, fast & low-RAM on cloud CPUs)
         mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        chroma = chunked_chroma_cqt(y=y, sr=sr)
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
         
         # Beat-synchronize features
         beat_frames = librosa.time_to_frames(beat_times, sr=sr)
         min_f = min(mfcc.shape[1], chroma.shape[1])
         features = np.vstack([mfcc[:, :min_f], chroma[:, :min_f]])
+        del mfcc, chroma
         features_sync = librosa.util.sync(features, beat_frames, aggregate=np.median)
+        del features
         
         # Estimate number of sections: typically 4 to 8 bars per section
         n_sections = max(2, min(8, int(np.round(total_bars / 8))))

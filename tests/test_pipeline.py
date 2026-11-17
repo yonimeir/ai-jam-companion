@@ -236,6 +236,28 @@ class TestJamCompanionPipeline(unittest.TestCase):
             self.assertEqual(body["metadata"]["source_url"], "https://youtu.be/abc12345")
             self.assertGreater(len(body["states"]), 0)
 
+            # Verify async job submission & status polling
+            import time
+            with patch("offline_pipeline.extract_song_map.download_audio_with_metadata", side_effect=fake_dl):
+                async_res = client.post(
+                    "/api/analyze-url-async",
+                    json={"url": "https://youtu.be/abc12345"},
+                )
+                self.assertEqual(async_res.status_code, 200)
+                job_id = async_res.json()["job_id"]
+                final_payload = None
+                for _ in range(100):
+                    st = client.get(f"/api/analyze/status/{job_id}")
+                    self.assertEqual(st.status_code, 200)
+                    data = st.json()
+                    if data["status"] in ("done", "error"):
+                        final_payload = data
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(final_payload)
+                self.assertEqual(final_payload["status"], "done")
+                self.assertEqual(final_payload["song_map"]["metadata"]["title"], "Mocked YouTube Ballad")
+
 
 if __name__ == "__main__":
     unittest.main()

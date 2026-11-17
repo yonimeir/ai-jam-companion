@@ -1302,29 +1302,90 @@
       if (reverbGain) reverbGain.gain.value = useReverb ? 0.22 : 0.0;
     };
 
+    async function pollAnalysisJob(jobId, onStage) {
+      let networkErrors = 0;
+      const maxPollMs = 10 * 60 * 1000;
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < maxPollMs) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const statusRes = await fetch(`/api/analyze/status/${encodeURIComponent(jobId)}`, { cache: "no-store" });
+          if (!statusRes.ok) {
+            if (statusRes.status === 404) {
+              throw new Error("השרת הופעל מחדש במהלך הניתוח (ייתכן עומס זיכרון). נסה קובץ MP3 קצר או דחוס יותר.");
+            }
+            let errTxt = await statusRes.text();
+            try { errTxt = JSON.parse(errTxt).detail || errTxt; } catch (_) {}
+            throw new Error(errTxt);
+          }
+          networkErrors = 0;
+          const payload = await statusRes.json();
+          if (payload.status === "done" && payload.song_map) {
+            return payload.song_map;
+          }
+          if (payload.status === "error") {
+            throw new Error(payload.detail || "הניתוח נכשל");
+          }
+          if (payload.stage && onStage) {
+            onStage(payload.stage);
+          }
+        } catch (err) {
+          if (err && err.name === "TypeError" && networkErrors < 5) {
+            networkErrors++;
+            if (onStage) onStage("⏳ חיבור רגעי אבד, מתחבר מחדש...");
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw new Error("הניתוח חרג מזמן ההמתנה המרבי.");
+    }
+
     // Audio MP3/WAV upload for real Python backend analysis
     document.getElementById("audioUpload").onchange = async (e) => {
       const file = e.target.files[0];
       if (!file) return;
       if (!backendConnected) {
-        alert("ניתוח אודיו חי (MP3/WAV) דורש הפעלת השרת המקומי: python3 server.py\nבמצב עצמאי ניתן לטעון קובץ JSON מנותח.");
-        return;
+        if (window.location.protocol === "file:") {
+          alert("ניתוח אודיו חי (MP3/WAV) דורש הפעלת השרת המקומי: python3 server.py\nבמצב עצמאי ניתן לטעון קובץ JSON מנותח.");
+          e.target.value = "";
+          return;
+        }
+        setYoutubeStatus("⏳ מעיר ומתחבר לשרת בענן...", "loading");
+        await checkBackend({ retries: 2, delayMs: 2500, loadSongMap: false });
+        if (!backendConnected) {
+          setYoutubeStatus("⚠️ השרת בענן כרגע אינו מגיב או מתעורר משינה — נסה שוב בעוד מספר שניות.", "error");
+          e.target.value = "";
+          return;
+        }
       }
       const label = document.getElementById("audioAnalyzeLabel");
       const oldHtml = label.innerHTML;
-      label.innerHTML = `<span>⏳ מנתח שיר (${file.name})...</span>`;
+      label.innerHTML = `<span>⏳ מעלה ומנתח (${file.name})...</span>`;
+      setYoutubeStatus(`⏳ מעלה את הקובץ ${file.name} לניתוח...`, "loading");
       try {
         const fd = new FormData();
         fd.append("file", file);
-        const res = await fetch("/api/analyze", { method: "POST", body: fd });
-        if (!res.ok) throw new Error(await res.text());
-        const mapData = await res.json();
+        const res = await fetch("/api/analyze-async", { method: "POST", body: fd });
+        if (!res.ok) {
+          let errMsg = await res.text();
+          try { errMsg = JSON.parse(errMsg).detail || errMsg; } catch (_) {}
+          throw new Error(errMsg);
+        }
+        const { job_id: jobId } = await res.json();
+        const mapData = await pollAnalysisJob(jobId, (stage) => {
+          label.innerHTML = `<span>⏳ ${stage}</span>`;
+          setYoutubeStatus(`⏳ ${file.name}: ${stage}`, "loading");
+        });
         loadBackendSongMap(mapData);
         if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "reset" }));
+        setYoutubeStatus(`✅ נטען בהצלחה: ${mapData.metadata.title} (${mapData.metadata.bpm} BPM • ${mapData.metadata.total_bars} תיבות). לחץ "התחל ג'ם" כדי לשיר!`, "success");
       } catch (err) {
+        setYoutubeStatus("❌ שגיאה בניתוח השיר: " + err.message, "error");
         alert("שגיאה בניתוח השיר: " + err.message);
       } finally {
         label.innerHTML = oldHtml;
+        e.target.value = "";
       }
     };
 
@@ -1392,10 +1453,10 @@
       const prevBtnText = btn.textContent;
       btn.disabled = true;
       btn.textContent = "⏳ מוריד ומנתח...";
-      setYoutubeStatus(`⏳ מוריד אודיו ומפיק מפת אקורדים ומלודיה מתוך: ${sharedTitle || cleanUrl} ... (עשוי להימשך 10–30 שניות)`, "loading");
+      setYoutubeStatus(`⏳ מוריד אודיו ומפיק מפת אקורדים ומלודיה מתוך: ${sharedTitle || cleanUrl} ...`, "loading");
 
       try {
-        const res = await fetch("/api/analyze-url", {
+        const res = await fetch("/api/analyze-url-async", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1408,7 +1469,10 @@
           try { errMsg = JSON.parse(errMsg).detail || errMsg; } catch (_) {}
           throw new Error(errMsg);
         }
-        const mapData = await res.json();
+        const { job_id: jobId } = await res.json();
+        const mapData = await pollAnalysisJob(jobId, (stage) => {
+          setYoutubeStatus(`⏳ ${sharedTitle || cleanUrl}: ${stage}`, "loading");
+        });
         loadBackendSongMap(mapData);
         if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "reset" }));
         setYoutubeStatus(`✅ נטען בהצלחה: ${mapData.metadata.title} (${mapData.metadata.bpm} BPM • ${mapData.metadata.total_bars} תיבות). לחץ "התחל ג'ם" כדי לשיר!`, "success");

@@ -6,14 +6,17 @@ and the Real-Time Engine (FFT-YIN, Online DTW, Harmonic State Machine, Voice-Lea
 """
 
 import asyncio
+import gc
 import json
 import os
 import struct
 import sys
 import tempfile
+import time
 import urllib.parse
+import uuid
 import zlib
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Query, Body
@@ -42,12 +45,15 @@ ACTIVE_VOCALS_PATH = os.path.join(tempfile.gettempdir(), "ai_jam_active_vocals.w
 WEB_INDEX_PATH = os.path.join(BASE_DIR, "web_studio", "index.html")
 SESSION_DIR = tempfile.mkdtemp(prefix="ai_jam_session_")
 
-# Active session state
+# Active session state & serialized background analysis jobs (safe for 512MB RAM cloud tiers)
 session_state: Dict[str, Any] = {
     "song_map": None,
     "last_tracker": None,
     "active_audio_path": DEMO_VOCALS_PATH if os.path.exists(DEMO_VOCALS_PATH) else None,
 }
+analysis_lock = asyncio.Lock()
+analysis_jobs: Dict[str, Dict[str, Any]] = {}
+MAX_STORED_JOBS = 5
 
 
 def _make_png_icon(size: int) -> bytes:
@@ -146,7 +152,7 @@ async def pwa_manifest():
 @app.get("/sw.js")
 async def pwa_service_worker():
     sw_code = """
-const CACHE_NAME = 'ai-jam-companion-v1';
+const CACHE_NAME = 'ai-jam-companion-v2';
 self.addEventListener('install', (event) => {
   self.skipWaiting();
 });
@@ -154,7 +160,16 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 self.addEventListener('fetch', (event) => {
-  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+  const url = new URL(event.request.url);
+  if (event.request.method !== 'GET' || url.pathname.startsWith('/api/')) {
+    return;
+  }
+  event.respondWith(
+    fetch(event.request).catch(async () => {
+      const cached = await caches.match(event.request);
+      return cached || Response.error();
+    })
+  );
 });
 """.strip()
     return Response(content=sw_code, media_type="application/javascript")
@@ -252,22 +267,97 @@ async def get_active_vocals():
     return FileResponse(audio_path, media_type="audio/wav", filename="active_vocals.wav")
 
 
-async def _run_analysis(source: str, title: str, artist: str) -> Dict[str, Any]:
+async def _save_upload_stream(file: UploadFile, dest_path: str) -> None:
+    """Streams an uploaded audio file directly to disk in 1MB chunks to keep RAM minimal."""
+    with open(dest_path, "wb") as out_f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out_f.write(chunk)
+    await file.close()
+
+
+async def _run_analysis(
+    source: str,
+    title: str,
+    artist: str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
     out_json = os.path.join(SESSION_DIR, "latest_song_map.json")
     vocals_wav = os.path.join(SESSION_DIR, "active_vocals.wav")
-    song_map = await asyncio.to_thread(
-        generate_song_map,
-        source,
-        out_json,
-        title,
-        artist,
-        22050,
-        vocals_wav,
-    )
-    session_state["song_map"] = song_map
-    if os.path.exists(vocals_wav):
-        session_state["active_audio_path"] = vocals_wav
-    return song_map
+    async with analysis_lock:
+        song_map = await asyncio.to_thread(
+            generate_song_map,
+            source,
+            out_json,
+            title,
+            artist,
+            22050,
+            vocals_wav,
+            progress_cb,
+        )
+        session_state["song_map"] = song_map
+        if os.path.exists(vocals_wav):
+            session_state["active_audio_path"] = vocals_wav
+        gc.collect()
+        return song_map
+
+
+def _prune_old_jobs() -> None:
+    if len(analysis_jobs) <= MAX_STORED_JOBS:
+        return
+    finished_ids = [
+        jid for jid, job in sorted(analysis_jobs.items(), key=lambda kv: kv[1].get("created_at", 0.0))
+        if job.get("status") in ("done", "error")
+    ]
+    for jid in finished_ids[: max(0, len(analysis_jobs) - MAX_STORED_JOBS)]:
+        analysis_jobs.pop(jid, None)
+
+
+def _create_analysis_job(
+    source: str,
+    title: str,
+    artist: str,
+    cleanup_path: Optional[str] = None,
+) -> str:
+    _prune_old_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    analysis_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "ממתין בתור לניתוח..." if analysis_lock.locked() else "מתחיל ניתוח...",
+        "created_at": time.time(),
+        "song_map": None,
+        "detail": None,
+    }
+
+    def _on_progress(stage: str) -> None:
+        job = analysis_jobs.get(job_id)
+        if job and job.get("status") not in ("done", "error"):
+            job["status"] = "processing"
+            job["stage"] = stage
+
+    async def _runner() -> None:
+        job = analysis_jobs[job_id]
+        try:
+            job["status"] = "processing"
+            song_map = await _run_analysis(source, title, artist, progress_cb=_on_progress)
+            job["song_map"] = song_map
+            job["stage"] = "הושלם!"
+            job["status"] = "done"
+        except Exception as exc:
+            job["detail"] = f"Analysis failed: {exc}"
+            job["status"] = "error"
+        finally:
+            if cleanup_path and os.path.exists(cleanup_path):
+                try:
+                    os.remove(cleanup_path)
+                except OSError:
+                    pass
+
+    asyncio.create_task(_runner())
+    return job_id
 
 
 @app.post("/api/analyze")
@@ -288,10 +378,8 @@ async def analyze_song(
     try:
         if file is not None:
             suffix = os.path.splitext(file.filename or "upload.wav")[1] or ".wav"
-            temp_input = os.path.join(SESSION_DIR, f"upload_{os.getpid()}{suffix}")
-            content = await file.read()
-            with open(temp_input, "wb") as out_f:
-                out_f.write(content)
+            temp_input = os.path.join(SESSION_DIR, f"upload_{uuid.uuid4().hex[:8]}{suffix}")
+            await _save_upload_stream(file, temp_input)
             source = temp_input
             if title == "Custom Song" and file.filename:
                 title = os.path.splitext(file.filename)[0]
@@ -315,6 +403,53 @@ async def analyze_song(
                 pass
 
 
+@app.post("/api/analyze-async")
+async def analyze_song_async(
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    title: str = Form("Custom Song"),
+    artist: str = Form("AI Jam User"),
+):
+    """
+    Starts audio analysis in the background and returns a job_id immediately
+    so cloud reverse proxies (e.g. Render 100s timeout) never drop long analyses.
+    """
+    if file is None and not (url and url.strip()):
+        raise HTTPException(status_code=400, detail="Provide either an audio file or a YouTube/media URL.")
+
+    temp_input = None
+    try:
+        if file is not None:
+            suffix = os.path.splitext(file.filename or "upload.wav")[1] or ".wav"
+            temp_input = os.path.join(SESSION_DIR, f"upload_{uuid.uuid4().hex[:8]}{suffix}")
+            await _save_upload_stream(file, temp_input)
+            source = temp_input
+            if title == "Custom Song" and file.filename:
+                title = os.path.splitext(file.filename)[0]
+        else:
+            clean_url = extract_media_url(url or "")
+            if not clean_url:
+                raise HTTPException(status_code=400, detail="Invalid URL. Please provide a valid http/https YouTube or media link.")
+            source = clean_url
+
+        job_id = _create_analysis_job(source, title, artist, cleanup_path=temp_input)
+        return JSONResponse(content={"job_id": job_id, "status": "queued"})
+    except HTTPException:
+        if temp_input and os.path.exists(temp_input):
+            try:
+                os.remove(temp_input)
+            except OSError:
+                pass
+        raise
+    except Exception as exc:
+        if temp_input and os.path.exists(temp_input):
+            try:
+                os.remove(temp_input)
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}")
+
+
 @app.post("/api/analyze-url")
 async def analyze_song_url_json(payload: Dict[str, Any] = Body(...)):
     """JSON convenience endpoint for analyzing a YouTube or web media link."""
@@ -329,6 +464,45 @@ async def analyze_song_url_json(payload: Dict[str, Any] = Body(...)):
         return JSONResponse(content=song_map)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}")
+
+
+@app.post("/api/analyze-url-async")
+async def analyze_song_url_async(payload: Dict[str, Any] = Body(...)):
+    """Starts URL/YouTube analysis in the background and returns a job_id immediately."""
+    raw_url = str(payload.get("url") or payload.get("text") or "").strip()
+    clean_url = extract_media_url(raw_url)
+    if not clean_url:
+        raise HTTPException(status_code=400, detail="Invalid or missing YouTube/media URL.")
+    title = str(payload.get("title") or "Custom Song")
+    artist = str(payload.get("artist") or "AI Jam User")
+    job_id = _create_analysis_job(clean_url, title, artist)
+    return JSONResponse(content={"job_id": job_id, "status": "queued"})
+
+
+@app.get("/api/analyze/status/{job_id}")
+async def get_analysis_job_status(job_id: str):
+    job = analysis_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Analysis job not found.")
+    if job["status"] == "done":
+        song_map = job["song_map"]
+        return JSONResponse(content={
+            "job_id": job_id,
+            "status": "done",
+            "stage": job["stage"],
+            "song_map": song_map,
+        })
+    if job["status"] == "error":
+        return JSONResponse(content={
+            "job_id": job_id,
+            "status": "error",
+            "detail": job.get("detail") or "Analysis failed",
+        })
+    return JSONResponse(content={
+        "job_id": job_id,
+        "status": job["status"],
+        "stage": job["stage"],
+    })
 
 
 @app.get("/api/export/midi")
