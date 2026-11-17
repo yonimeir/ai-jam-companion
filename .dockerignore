@@ -1,9 +1,0 @@
-.git
-.venv
-venv
-__pycache__
-*.pyc
-*.pyo
-.DS_Store
-audio_samples/*.wav
-audio_samples/*.mid
