@@ -1,13 +1,14 @@
 package com.aijam.companion.data
 
 import android.content.Context
+import android.net.Uri
 import com.aijam.companion.model.LyricLine
 import com.aijam.companion.model.SongMap
 import com.aijam.companion.model.SongMapJson
 import java.io.File
 
 /**
- * Local-first song library repository backed by bundled demo assets and app-private JSON files.
+ * Local-first song library repository backed by bundled demo assets and app-private JSON/audio files.
  */
 class SongLibraryRepository(private val context: Context) {
 
@@ -15,6 +16,25 @@ class SongLibraryRepository(private val context: Context) {
         File(context.filesDir, "songs").apply {
             if (!exists()) mkdirs()
         }
+    }
+
+    private val audioDir: File by lazy {
+        File(context.filesDir, "audio").apply {
+            if (!exists()) mkdirs()
+        }
+    }
+
+    fun copyAudioToLocalStorage(uri: Uri, songId: String): String? {
+        val safeId = sanitizeId(songId)
+        val outFile = File(audioDir, "$safeId.audio")
+        return runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                outFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            if (outFile.exists() && outFile.length() > 0L) outFile.absolutePath else null
+        }.getOrNull()
     }
 
     fun loadDemoSong(): SongMap {
@@ -61,6 +81,7 @@ class SongLibraryRepository(private val context: Context) {
     fun deleteSong(songId: String): Boolean {
         val safeId = sanitizeId(songId)
         if (safeId == DEMO_SONG_ID) return false
+        File(audioDir, "$safeId.audio").takeIf { it.exists() }?.delete()
         val target = File(songsDir, "$safeId.json")
         return target.exists() && target.delete()
     }
@@ -74,3 +95,4 @@ class SongLibraryRepository(private val context: Context) {
         }
     }
 }
+

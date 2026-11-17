@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.GraphicEq
@@ -65,6 +66,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -82,16 +84,19 @@ import com.aijam.companion.audio.JamSessionController
 import com.aijam.companion.model.AccompanimentStyle
 import com.aijam.companion.model.InputMode
 import com.aijam.companion.ui.components.ChordRibbon
+import com.aijam.companion.ui.components.DiagnosticsSheet
 import com.aijam.companion.ui.components.LyricsEditorSheet
 import com.aijam.companion.ui.components.LyricsTeleprompter
 import com.aijam.companion.ui.components.PianoKeyboard
 import com.aijam.companion.ui.components.SongLibrarySheet
 import com.aijam.companion.ui.components.StageVisualizer
 import com.aijam.companion.ui.theme.StageColors
+import kotlinx.coroutines.launch
 
 @Composable
 fun StudioScreen(controller: JamSessionController) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val songMap by controller.songMap.collectAsState()
     val library by controller.library.collectAsState()
     val liveState by controller.liveState.collectAsState()
@@ -107,6 +112,7 @@ fun StudioScreen(controller: JamSessionController) {
     var showLibrarySheet by remember { mutableStateOf(false) }
     var showLyricsSheet by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var showDiagnosticsSheet by remember { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(statusMessage) {
@@ -182,6 +188,7 @@ fun StudioScreen(controller: JamSessionController) {
                 isAnalyzing = analysisState.isAnalyzing,
                 onOpenLibrary = { showLibrarySheet = true },
                 onOpenLyrics = { showLyricsSheet = true },
+                onOpenDiagnostics = { showDiagnosticsSheet = true },
                 onOpenSettings = { showSettingsSheet = true }
             )
         },
@@ -321,7 +328,23 @@ fun StudioScreen(controller: JamSessionController) {
                 val safeTitle = songMap.metadata.title.replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "ai_jam" }
                 midiExportLauncher.launch("${safeTitle}_live.mid")
             },
+            onOpenDiagnostics = {
+                showSettingsSheet = false
+                showDiagnosticsSheet = true
+            },
             onDismiss = { showSettingsSheet = false }
+        )
+    }
+
+    if (showDiagnosticsSheet) {
+        DiagnosticsSheet(
+            buildReport = { controller.buildDiagnosticReport() },
+            onClearLogs = { controller.clearDiagnosticLogs() },
+            onCopiedMessage = { msg ->
+                showDiagnosticsSheet = false
+                scope.launch { snackbarHostState.showSnackbar(msg) }
+            },
+            onDismiss = { showDiagnosticsSheet = false }
         )
     }
 }
@@ -333,6 +356,7 @@ private fun StudioTopBar(
     isAnalyzing: Boolean,
     onOpenLibrary: () -> Unit,
     onOpenLyrics: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     Row(
@@ -396,8 +420,8 @@ private fun StudioTopBar(
             }
         }
 
-        // Action icons: Library / Lyrics / Settings
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        // Action icons: Library / Lyrics / Diagnostics / Settings
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
             IconButton(onClick = onOpenLibrary) {
                 Icon(
                     imageVector = Icons.Rounded.LibraryMusic,
@@ -410,6 +434,13 @@ private fun StudioTopBar(
                     imageVector = Icons.Rounded.Lyrics,
                     contentDescription = "ערוך מילים",
                     tint = StageColors.Cyan
+                )
+            }
+            IconButton(onClick = onOpenDiagnostics) {
+                Icon(
+                    imageVector = Icons.Rounded.BugReport,
+                    contentDescription = "לוגים ודיאגנוסטיקה",
+                    tint = StageColors.Brass
                 )
             }
             IconButton(onClick = onOpenSettings) {
@@ -593,6 +624,7 @@ private fun StudioSettingsSheet(
     onSimSpeedChange: (Float) -> Unit,
     onToggleHearSinger: (Boolean) -> Unit,
     onExportMidi: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -662,12 +694,12 @@ private fun StudioSettingsSheet(
 
             // Switches
             SettingSwitchRow(
-                label = "תופים מינימליסטיים (קיק / ריים / היי-הט)",
+                label = "תופים מינימליסטיים (קיק / ריים / מברשות)",
                 checked = includeDrums,
                 onCheckedChange = onToggleDrums
             )
             SettingSwitchRow(
-                label = "השמע זמר דמו בסינתיזה (במצב דמו)",
+                label = "נגן אודיו מקורי של השיר (בקובץ שיובא מהמכשיר)",
                 checked = hearSinger,
                 onCheckedChange = onToggleHearSinger
             )
@@ -686,31 +718,61 @@ private fun StudioSettingsSheet(
                 onValueChange = onConfidenceChange
             )
             SettingSliderRow(
-                label = "מהירות זמר דמו: x${"%.2f".format(simSpeed)}",
+                label = "מהירות נגינה (מצב דמו/אימון): x${"%.2f".format(simSpeed)}",
                 value = simSpeed,
                 range = 0.65f..1.45f,
                 onValueChange = onSimSpeedChange
             )
 
-            OutlinedButton(
-                onClick = onExportMidi,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, StageColors.Cyan.copy(alpha = 0.55f))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.FileDownload,
-                    contentDescription = null,
-                    tint = StageColors.Cyan
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "ייצוא ביצוע חי לקובץ MIDI (.mid)",
-                    color = StageColors.Cyan,
-                    fontWeight = FontWeight.Bold
-                )
+                OutlinedButton(
+                    onClick = onExportMidi,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, StageColors.Cyan.copy(alpha = 0.55f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.FileDownload,
+                        contentDescription = null,
+                        tint = StageColors.Cyan,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "ייצוא MIDI",
+                        color = StageColors.Cyan,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onOpenDiagnostics,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, StageColors.Gold.copy(alpha = 0.55f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.BugReport,
+                        contentDescription = null,
+                        tint = StageColors.Gold,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "ייצוא לוגים",
+                        color = StageColors.Gold,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
     }

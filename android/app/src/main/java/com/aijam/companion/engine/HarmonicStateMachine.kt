@@ -20,14 +20,16 @@ data class HarmonicState(
 
 /**
  * Harmonic State Machine (Stage C).
- * Manages chord state, confidence-gated transitions, and automatic Vamp looping
- * during breath pauses or vocal improvisation.
+ * - Differentiates between beat progression within the same chord vs. actual harmonic chord transitions.
+ * - Only enters automatic VAMP when the reference song expects vocals and the singer pauses >= pauseToVampSec
+ *   (never gets stuck in VAMP during instrumental intros/interludes!).
+ * - Cleanly exits VAMP back to PLAYING as soon as the singer resumes singing.
  */
 class HarmonicStateMachine(
     songMap: SongMap,
-    var confidenceThreshold: Double = 0.58,
+    var confidenceThreshold: Double = 0.52,
     private val minConfirmFrames: Int = 2,
-    private val pauseToVampSec: Double = 0.5
+    private val pauseToVampSec: Double = 1.15
 ) {
     val chords: List<ChordEvent> = songMap.chords.ifEmpty {
         listOf(
@@ -91,18 +93,23 @@ class HarmonicStateMachine(
         refTime: Double,
         confidence: Double,
         isVoiced: Boolean,
-        dt: Double
+        dt: Double,
+        refExpectsVocal: Boolean = true
     ): HarmonicState {
         var transitionOccurred = false
-        if (!isVoiced || forceVampHold) {
+        if (forceVampHold) {
+            unvoicedDuration += dt
+        } else if (!isVoiced && refExpectsVocal) {
             unvoicedDuration += dt
         } else {
             unvoicedDuration = 0.0
         }
 
         val targetIdx = findChordIndexAtTime(refTime)
+        val currEvent = chords[currentChordIdx]
+        val targetEvent = chords[targetIdx]
 
-        if (forceVampHold || unvoicedDuration >= pauseToVampSec) {
+        if (forceVampHold || (refExpectsVocal && unvoicedDuration >= pauseToVampSec)) {
             engineMode = EngineMode.VAMPING
             vampTimer += dt
             if (vampTimer >= beatDuration) {
@@ -110,40 +117,48 @@ class HarmonicStateMachine(
                 vampBeat = (vampBeat % 4) + 1
             }
         } else {
+            // If the chord symbol is identical (just advancing beats within the same bar/chord)
+            // or we are in an instrumental passage, advance immediately without blocking!
+            val isSameHarmony = targetEvent.chord == currEvent.chord && targetEvent.bar == currEvent.bar
             if (targetIdx != currentChordIdx) {
-                if (targetIdx == candidateChordIdx) {
-                    confirmCount++
-                } else {
-                    candidateChordIdx = targetIdx
-                    confirmCount = 1
-                }
-
-                if (confidence >= confidenceThreshold && confirmCount >= minConfirmFrames) {
+                if (isSameHarmony || !refExpectsVocal) {
                     currentChordIdx = targetIdx
-                    engineMode = EngineMode.PLAYING
                     confirmCount = 0
-                    vampBeat = 1
-                    transitionOccurred = true
+                    engineMode = EngineMode.PLAYING
                 } else {
-                    engineMode = EngineMode.CONFIDENCE_WAIT
+                    if (targetIdx == candidateChordIdx) {
+                        confirmCount++
+                    } else {
+                        candidateChordIdx = targetIdx
+                        confirmCount = 1
+                    }
+
+                    if (confidence >= confidenceThreshold && confirmCount >= minConfirmFrames) {
+                        currentChordIdx = targetIdx
+                        engineMode = EngineMode.PLAYING
+                        confirmCount = 0
+                        vampBeat = 1
+                        transitionOccurred = true
+                    } else {
+                        engineMode = EngineMode.CONFIDENCE_WAIT
+                    }
                 }
             } else {
                 confirmCount = 0
-                if (engineMode != EngineMode.VAMPING) {
-                    engineMode = EngineMode.PLAYING
-                }
+                // Cleanly return from VAMPING to PLAYING as soon as singing resumes!
+                engineMode = EngineMode.PLAYING
             }
         }
 
-        val curr = chords[currentChordIdx]
+        val active = chords[currentChordIdx]
         return HarmonicState(
-            chord = curr.chord,
-            root = curr.root,
-            quality = curr.quality,
-            bar = curr.bar,
-            beat = curr.beat,
-            section = sectionForBar(curr.bar),
-            notes = curr.notes,
+            chord = active.chord,
+            root = active.root,
+            quality = active.quality,
+            bar = active.bar,
+            beat = active.beat,
+            section = sectionForBar(active.bar),
+            notes = active.notes,
             engineMode = engineMode,
             confidence = confidence,
             vampCycleBeat = vampBeat,

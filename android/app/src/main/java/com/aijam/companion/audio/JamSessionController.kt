@@ -4,8 +4,11 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.media.PlaybackParams
 import android.net.Uri
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aijam.companion.data.LyricsParser
@@ -17,6 +20,12 @@ import com.aijam.companion.model.AccompanimentStyle
 import com.aijam.companion.model.InputMode
 import com.aijam.companion.model.LiveJamState
 import com.aijam.companion.model.SongMap
+import com.aijam.companion.util.DiagnosticLogger
+import java.io.File
+import kotlin.math.PI
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -25,11 +34,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.PI
-import kotlin.math.exp
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sin
 
 data class AnalysisUiState(
     val isAnalyzing: Boolean = false,
@@ -39,8 +43,8 @@ data class AnalysisUiState(
 )
 
 /**
- * Coordinates the live jam engine, AudioRecord microphone capture, Demo singer synthesis,
- * low-latency AudioTrack accompaniment synth, on-device MP3/WAV analysis, lyrics, and MIDI export.
+ * Coordinates the live jam engine, AudioRecord microphone capture, steady Demo/Practice playback,
+ * low-latency AudioTrack accompaniment synth, on-device MP3/WAV analysis, lyrics, MIDI, and diagnostics.
  */
 class JamSessionController(application: Application) : AndroidViewModel(application) {
 
@@ -62,7 +66,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     private val _includeDrums = MutableStateFlow(true)
     val includeDrums: StateFlow<Boolean> = _includeDrums.asStateFlow()
 
-    private val _reverbMix = MutableStateFlow(0.28f)
+    private val _reverbMix = MutableStateFlow(0.26f)
     val reverbMix: StateFlow<Float> = _reverbMix.asStateFlow()
 
     private val _confidenceThreshold = MutableStateFlow(0.55f)
@@ -83,6 +87,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     private var tracker: RealtimeJamTracker = createTracker(_songMap.value)
     private var jamJob: Job? = null
     private var analysisJob: Job? = null
+    @Volatile private var activeMediaPlayer: MediaPlayer? = null
 
     private val pitchHistory = ArrayDeque<Float>(64)
     private val targetHistory = ArrayDeque<Float>(64)
@@ -94,6 +99,10 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     init {
         _library.value = repository.listSongs()
         synth.reverbMix = _reverbMix.value
+        DiagnosticLogger.log(
+            "INIT",
+            "App initialized with song='${_songMap.value.metadata.title}' (${_songMap.value.metadata.bpm} BPM, ${_songMap.value.metadata.totalBars} bars)"
+        )
     }
 
     private fun initialLiveState(song: SongMap): LiveJamState {
@@ -131,9 +140,19 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         _statusMessage.value = null
     }
 
+    fun buildDiagnosticReport(): String {
+        return DiagnosticLogger.buildFullReport(_songMap.value, _liveState.value)
+    }
+
+    fun clearDiagnosticLogs() {
+        DiagnosticLogger.clear()
+        _statusMessage.value = "יומן הלוגים נוקה"
+    }
+
     fun setInputMode(mode: InputMode) {
         val wasRunning = _liveState.value.isRunning
         if (wasRunning) stopJam()
+        DiagnosticLogger.log("MODE", "Switched input mode to ${mode.name}")
         _liveState.value = _liveState.value.copy(inputMode = mode)
         if (wasRunning) startJam()
     }
@@ -141,6 +160,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     fun setStyle(newStyle: AccompanimentStyle) {
         _style.value = newStyle
         tracker.style = newStyle
+        DiagnosticLogger.log("STYLE", "Changed accompaniment style to ${newStyle.name}")
     }
 
     fun setIncludeDrums(enabled: Boolean) {
@@ -161,17 +181,31 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     }
 
     fun setSimSpeed(speed: Float) {
-        _simSpeed.value = speed.coerceIn(0.6f, 1.5f)
+        val clamped = speed.coerceIn(0.6f, 1.5f)
+        _simSpeed.value = clamped
+        runCatching {
+            val mp = activeMediaPlayer
+            if (mp != null && mp.isPlaying && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                mp.playbackParams = PlaybackParams().setSpeed(clamped)
+            }
+        }
     }
 
     fun setHearSinger(enabled: Boolean) {
         _hearSinger.value = enabled
-        if (!enabled) synth.setDemoVoice(0.0, false, 0f)
+        runCatching {
+            val mp = activeMediaPlayer
+            if (mp != null) {
+                val vol = if (enabled) 0.52f else 0f
+                mp.setVolume(vol, vol)
+            }
+        }
     }
 
     fun setForceVampHold(hold: Boolean) {
         tracker.stateMachine.forceVampHold = hold
         _liveState.value = _liveState.value.copy(isVampHolding = hold)
+        DiagnosticLogger.log("VAMP", "Manual Vamp Hold set to $hold")
     }
 
     fun toggleJam() {
@@ -181,6 +215,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     fun startJam() {
         if (jamJob?.isActive == true) return
         val mode = _liveState.value.inputMode
+        DiagnosticLogger.onSessionStart(mode.name, _songMap.value.metadata.title)
         _liveState.value = _liveState.value.copy(isRunning = true)
         jamJob = viewModelScope.launch(Dispatchers.Default) {
             if (mode == InputMode.MIC) {
@@ -194,10 +229,12 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     fun stopJam() {
         jamJob?.cancel()
         jamJob = null
+        releaseActiveMediaPlayer()
         synth.panic()
         keyExpiryMs.clear()
         beatPulseLevel = 0f
         drumPulseLevel = 0f
+        DiagnosticLogger.log("SESSION", "Stopped playback at t=${"%.2f".format(_liveState.value.refTimeSec)}s (Bar ${_liveState.value.currentBar})")
         _liveState.value = _liveState.value.copy(
             isRunning = false,
             isVoiced = false,
@@ -228,12 +265,16 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     fun jumpToTime(timeSec: Double) {
         val target = timeSec.coerceIn(0.0, _songMap.value.metadata.duration)
         tracker.jumpToTime(target)
+        runCatching {
+            activeMediaPlayer?.seekTo((target * 1000.0).toInt())
+        }
         val state = _songMap.value.states.firstOrNull { target >= it.startTime && target < it.endTime }
             ?: _songMap.value.states.minByOrNull { kotlin.math.abs(it.startTime - target) }
         val pct = if (_songMap.value.metadata.duration > 0.0) {
             ((target / _songMap.value.metadata.duration) * 100.0).toFloat().coerceIn(0f, 100f)
         } else 0f
 
+        DiagnosticLogger.log("SEEK", "User seeked to ${"%.2f".format(target)}s (Bar ${state?.bar ?: 1}, Chord ${state?.chord ?: "?"})")
         _liveState.value = _liveState.value.copy(
             refTimeSec = target,
             progressPct = pct,
@@ -257,6 +298,10 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         pitchHistory.clear()
         targetHistory.clear()
         _liveState.value = initialLiveState(song).copy(inputMode = _liveState.value.inputMode)
+        DiagnosticLogger.log(
+            "SONG",
+            "Selected song '${song.metadata.title}' (${song.metadata.bpm} BPM, ${song.metadata.totalBars} bars, audioPath=${song.metadata.audioPath != null})"
+        )
         _statusMessage.value = "נטען: ${song.metadata.title}"
     }
 
@@ -292,6 +337,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         analysisJob = viewModelScope.launch(Dispatchers.Default) {
             try {
                 val context = getApplication<Application>().applicationContext
+                DiagnosticLogger.log("IMPORT", "Starting on-device audio decode for URI=$uri")
                 _analysisState.value = AnalysisUiState(
                     isAnalyzing = true,
                     progress = 0.04f,
@@ -309,12 +355,19 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
                 val newId = SongLibraryRepository.sanitizeId(
                     "${decoded.title}_${System.currentTimeMillis() % 10000}"
                 )
+                val localAudioPath = repository.copyAudioToLocalStorage(uri, newId)
+                DiagnosticLogger.log(
+                    "IMPORT",
+                    "Decoded '${decoded.title}' (${"%.1f".format(decoded.durationSec)}s, ${decoded.samples.size} samples @ ${decoded.sampleRate}Hz, audioSaved=${localAudioPath != null})"
+                )
+
                 val analyzed = OfflineSongAnalyzer.analyze(
                     samples = decoded.samples,
                     sampleRate = decoded.sampleRate,
                     id = newId,
                     title = decoded.title,
-                    artist = decoded.artist
+                    artist = decoded.artist,
+                    audioPath = localAudioPath
                 ) { dspPct, msg ->
                     _analysisState.value = AnalysisUiState(
                         isAnalyzing = true,
@@ -329,6 +382,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
                 selectSong(saved)
                 _statusMessage.value = "נותח בהצלחה: ${saved.metadata.title} (${saved.metadata.bpm.toInt()} BPM)"
             } catch (e: Exception) {
+                DiagnosticLogger.log("ERROR", "Audio import failed: ${e.javaClass.simpleName}: ${e.message}")
                 _analysisState.value = AnalysisUiState(
                     isAnalyzing = false,
                     progress = 0f,
@@ -349,82 +403,105 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         )
     }
 
+    private fun releaseActiveMediaPlayer() {
+        val mp = activeMediaPlayer
+        activeMediaPlayer = null
+        if (mp != null) {
+            runCatching {
+                if (mp.isPlaying) mp.stop()
+            }
+            runCatching { mp.release() }
+        }
+    }
+
     private suspend fun runDemoLoop() {
         val hopSize = 512
         val sampleRate = 22050
+        val hopDt = hopSize.toDouble() / sampleRate
         val hopMs = (hopSize * 1000.0) / sampleRate
-        val chunk = FloatArray(hopSize)
-        val anchor = _songMap.value.vocalAnchor
-        val totalAnchorFrames = anchor.times.size
-
-        var anchorPos: Double = if (anchor.times.isNotEmpty()) {
-            val currRef = _liveState.value.refTimeSec
-            anchor.times.indexOfFirst { it >= currRef }.let { if (it < 0) 0.0 else it.toDouble() }
-        } else 0.0
-
-        var synthPhase = 0.0
-        var vibPhase = 0.0
+        val visualWave = FloatArray(hopSize)
+        var visualPhase = 0.0
         val twoPi = 2.0 * PI
 
-        while (coroutineContextIsActive()) {
-            val stepStartNs = System.nanoTime()
-            val speed = _simSpeed.value.toDouble()
-            val frameIdx = anchorPos.toInt().coerceIn(0, max(0, totalAnchorFrames - 1))
+        // If this song was imported from an audio file on the device, prepare MediaPlayer for optional synced playback
+        val localAudioFile = _songMap.value.metadata.audioPath
+            ?.let { File(it) }
+            ?.takeIf { it.exists() && it.length() > 0L }
 
-            val isVoicedRef = totalAnchorFrames > 0 &&
-                anchor.voicedProb[frameIdx] > 0.35 &&
-                anchor.f0Hz[frameIdx] > 50.0
-            val refF0 = if (isVoicedRef) anchor.f0Hz[frameIdx] else 0.0
-            val rmsDb = if (totalAnchorFrames > 0) anchor.rmsDb[frameIdx] else -55.0
-            val amp = if (isVoicedRef) {
-                (0.14 * exp((rmsDb.coerceIn(-45.0, -8.0) + 20.0) / 22.0)).toFloat().coerceIn(0.06f, 0.42f)
-            } else 0.0f
+        val mp: MediaPlayer? = if (localAudioFile != null) {
+            runCatching {
+                MediaPlayer().apply {
+                    setDataSource(localAudioFile.absolutePath)
+                    isLooping = true
+                    prepare()
+                    val startMs = (_liveState.value.refTimeSec * 1000.0).toInt()
+                    if (startMs > 0) seekTo(startMs)
+                    val vol = if (_hearSinger.value) 0.52f else 0f
+                    setVolume(vol, vol)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && _simSpeed.value != 1.0f) {
+                        playbackParams = PlaybackParams().setSpeed(_simSpeed.value)
+                    }
+                    start()
+                }
+            }.onFailure { err ->
+                DiagnosticLogger.log("AUDIO", "Could not start original audio MediaPlayer: ${err.message}")
+            }.getOrNull()
+        } else null
+        activeMediaPlayer = mp
 
-            // Synthesize clean harmonic vocal hop buffer for real-time FFT-YIN tracker
-            for (i in 0 until hopSize) {
-                if (isVoicedRef) {
-                    vibPhase = (vibPhase + twoPi * 5.1 / sampleRate) % twoPi
-                    val f = refF0 * (1.0 + 0.005 * sin(vibPhase))
-                    synthPhase = (synthPhase + twoPi * f / sampleRate) % twoPi
-                    chunk[i] = (amp * (0.72 * sin(synthPhase) + 0.28 * sin(2.0 * synthPhase))).toFloat()
+        try {
+            while (coroutineContextIsActive()) {
+                val stepStartNs = System.nanoTime()
+                val speed = _simSpeed.value.toDouble()
+
+                // Pause original audio track if user is holding VAMP
+                if (mp != null) {
+                    runCatching {
+                        val vol = if (_hearSinger.value && !tracker.stateMachine.forceVampHold) 0.52f else 0f
+                        mp.setVolume(vol, vol)
+                        if (tracker.stateMachine.forceVampHold && mp.isPlaying) {
+                            mp.pause()
+                        } else if (!tracker.stateMachine.forceVampHold && !mp.isPlaying) {
+                            mp.start()
+                        }
+                    }
+                }
+
+                val extSec = if (mp != null && !tracker.stateMachine.forceVampHold) {
+                    runCatching { mp.currentPosition / 1000.0 }.getOrNull()
+                } else null
+
+                val res = tracker.stepSteadyClock(
+                    dtSec = hopDt,
+                    speedMultiplier = speed,
+                    externalTimeSec = extSec
+                )
+
+                // Generate clean visual waveform for the UI oscilloscope
+                val waveFreq = if (res.isVoiced && res.singerF0Hz > 65.0) {
+                    res.singerF0Hz
                 } else {
-                    // Low-level room floor when breathing / silent
-                    chunk[i] = ((sin(i * 0.37) * 0.0005)).toFloat()
+                    110.0 + (res.chordNotes.firstOrNull() ?: 60) * 2.0
                 }
-            }
-
-            if (_hearSinger.value && !tracker.stateMachine.forceVampHold) {
-                synth.setDemoVoice(refF0, isVoicedRef, amp * 0.72f)
-            } else {
-                synth.setDemoVoice(0.0, false, 0f)
-            }
-
-            val res = tracker.processAudioBuffer(chunk)
-            if (res != null) {
-                handleStepResult(res, chunk)
-            }
-
-            if (!tracker.stateMachine.forceVampHold && totalAnchorFrames > 1) {
-                anchorPos += speed
-                if (anchorPos >= totalAnchorFrames - 1) {
-                    // Smooth loop restart from beginning
-                    anchorPos = 0.0
-                    tracker.jumpToTime(0.0)
-                    pitchHistory.clear()
-                    targetHistory.clear()
+                val waveAmp = if (res.isVoiced) 0.28f else 0.12f * beatPulseLevel.coerceAtLeast(0.2f)
+                for (i in 0 until hopSize) {
+                    visualPhase = (visualPhase + twoPi * waveFreq / sampleRate) % twoPi
+                    visualWave[i] = (waveAmp * (0.75 * sin(visualPhase) + 0.25 * sin(2.0 * visualPhase))).toFloat()
                 }
-            }
 
-            val elapsedMs = (System.nanoTime() - stepStartNs) / 1_000_000.0
-            val sleepMs = max(4L, (hopMs - elapsedMs).toLong())
-            delay(sleepMs)
+                handleStepResult(res, visualWave)
+
+                val elapsedMs = (System.nanoTime() - stepStartNs) / 1_000_000.0
+                val sleepMs = max(5L, (hopMs - elapsedMs).toLong())
+                delay(sleepMs)
+            }
+        } finally {
+            releaseActiveMediaPlayer()
         }
-        synth.setDemoVoice(0.0, false, 0f)
     }
 
     @SuppressLint("MissingPermission")
     private suspend fun runMicrophoneLoop() {
-        synth.setDemoVoice(0.0, false, 0f)
         val sampleRate = 22050
         val hopSize = 512
         val minBuf = AudioRecord.getMinBufferSize(
@@ -442,6 +519,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
                 minBuf
             )
         } catch (_: SecurityException) {
+            DiagnosticLogger.log("MIC_ERR", "SecurityException: Microphone permission not granted")
             _statusMessage.value = "נדרשת הרשאת מיקרופון להאזנה חיה"
             _liveState.value = _liveState.value.copy(isRunning = false, inputMode = InputMode.DEMO)
             return
@@ -449,6 +527,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
 
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             recorder.release()
+            DiagnosticLogger.log("MIC_ERR", "AudioRecord failed to initialize (state=${recorder.state})")
             _statusMessage.value = "לא ניתן לפתוח את המיקרופון במכשיר"
             _liveState.value = _liveState.value.copy(isRunning = false)
             return
@@ -459,6 +538,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
 
         try {
             recorder.startRecording()
+            DiagnosticLogger.log("MIC", "AudioRecord started @ ${sampleRate}Hz (hop=$hopSize)")
             while (coroutineContextIsActive()) {
                 val read = recorder.read(shortBuf, 0, hopSize)
                 if (read > 0) {
@@ -562,7 +642,7 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         if (anchor.times.isEmpty()) return 0f
         val approxIdx = ((refTime / _songMap.value.metadata.duration.coerceAtLeast(0.1)) *
             (anchor.times.size - 1)).toInt().coerceIn(0, anchor.times.lastIndex)
-        return if (anchor.voicedProb[approxIdx] > 0.35 && anchor.midiNotes[approxIdx] > 0.0) {
+        return if (anchor.voicedProb[approxIdx] > 0.45 && anchor.midiNotes[approxIdx] > 0.0) {
             anchor.midiNotes[approxIdx].toFloat()
         } else 0f
     }
@@ -574,3 +654,4 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         super.onCleared()
     }
 }
+

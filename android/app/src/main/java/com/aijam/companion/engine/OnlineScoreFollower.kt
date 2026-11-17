@@ -5,18 +5,20 @@ import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
- * Online Dynamic Time Warping (ODTW) score follower.
- * Tracks live singer position against the song's reference vocal contour,
- * handling intros, breath pauses, tempo drift, octave jumps, and forward skips.
+ * Monotonic, jitter-free Online Dynamic Time Warping (ODTW) score follower.
+ * - Advances automatically at 1.0x during instrumental intros/interludes.
+ * - Never jumps backwards (monotonic frame progression).
+ * - Smoothly tracks live vocal phrasing with bounded per-hop rate (0..2 frames/hop).
  */
 class OnlineScoreFollower(
     songMap: SongMap,
-    private val windowSizeFrames: Int = 120,
+    private val windowSizeFrames: Int = 96,
     private val stepPenalty: Double = 0.0,
-    private val stayPenalty: Double = 0.06,
-    private val skipPenalty: Double = 0.03
+    private val stayPenalty: Double = 0.08,
+    private val skipPenalty: Double = 0.05
 ) {
     private val refTimes = songMap.vocalAnchor.times
     private val refPitches = songMap.vocalAnchor.midiNotes
@@ -37,16 +39,15 @@ class OnlineScoreFollower(
 
     var currentFrame: Int = 0
         private set
+    private var fractionalFrame: Double = 0.0
     var estimatedTempoRatio: Double = 1.0
         private set
-    var confidence: Double = 0.5
+    var confidence: Double = 0.75
         private set
 
     private val accumulatedCosts = DoubleArray(totalFrames)
     private var hasLockedVocal = false
     private val frameHistory = ArrayDeque<Int>(48)
-    private val recentVoicedPitches = ArrayDeque<Double>(20)
-    private var mismatchStreak = 0
 
     init {
         reset()
@@ -54,14 +55,29 @@ class OnlineScoreFollower(
 
     fun reset() {
         currentFrame = 0
+        fractionalFrame = 0.0
         estimatedTempoRatio = 1.0
         accumulatedCosts.fill(100.0)
         if (totalFrames > 0) accumulatedCosts[0] = 0.0
-        confidence = 0.5
+        confidence = 0.75
         hasLockedVocal = false
         frameHistory.clear()
-        recentVoicedPitches.clear()
-        mismatchStreak = 0
+    }
+
+    /**
+     * Returns true if the reference song map expects vocal singing at [frameIdx]
+     * (checks a tight ±4 frame / ~90ms neighborhood so brief consonant gaps don't flip state,
+     * while advancing cleanly all the way to [firstVocalFrame] during the instrumental intro).
+     */
+    fun isReferenceVocalExpected(frameIdx: Int = currentFrame): Boolean {
+        if (totalFrames == 0 || frameIdx < firstVocalFrame) return false
+        val start = max(0, frameIdx - 4)
+        val end = min(totalFrames - 1, frameIdx + 4)
+        var voicedCount = 0
+        for (i in start..end) {
+            if (refVoiced[i] > 0.35 && refPitches[i] > 0.0) voicedCount++
+        }
+        return voicedCount >= 3
     }
 
     private fun frameCosts(
@@ -86,13 +102,13 @@ class OnlineScoreFollower(
             val rp = refPitches[j]
             val rv = refVoiced[j] > 0.35 && rp > 0.0
             if (!rv) {
-                costs[i] = 0.78
+                costs[i] = 0.65
             } else {
                 val diff = abs(liveMidi - rp)
                 val mod12 = diff % 12.0
                 val octDiff = min(mod12, 12.0 - mod12)
-                val bestDiff = min(diff, octDiff + 1.2)
-                val ratio = bestDiff / 2.2
+                val bestDiff = min(diff, octDiff + 1.0)
+                val ratio = bestDiff / 2.4
                 costs[i] = 1.0 - exp(-(ratio * ratio))
             }
         }
@@ -101,8 +117,8 @@ class OnlineScoreFollower(
 
     private fun tryVocalEntryLock(liveMidi: Double) {
         if (totalFrames == 0) return
-        val searchStart = max(0, firstVocalFrame - 15)
-        val searchEnd = min(totalFrames, firstVocalFrame + 120)
+        val searchStart = max(currentFrame, firstVocalFrame - 12)
+        val searchEnd = min(totalFrames, firstVocalFrame + 60)
         if (searchEnd <= searchStart) return
 
         var bestOffset = -1
@@ -110,94 +126,62 @@ class OnlineScoreFollower(
         for (j in searchStart until searchEnd) {
             if (refVoiced[j] > 0.35 && refPitches[j] > 0.0) {
                 val d = abs(liveMidi - refPitches[j])
-                if (d < bestDiff) {
-                    bestDiff = d
+                val mod12 = d % 12.0
+                val octD = min(mod12, 12.0 - mod12)
+                val effD = min(d, octD + 0.8)
+                if (effD < bestDiff) {
+                    bestDiff = effD
                     bestOffset = j
                 }
             }
         }
-        if (bestOffset >= 0 && bestDiff <= 2.5) {
+        if (bestOffset >= currentFrame && bestDiff <= 2.2) {
             currentFrame = bestOffset
+            fractionalFrame = bestOffset.toDouble()
             accumulatedCosts.fill(50.0)
             accumulatedCosts[bestOffset] = 0.0
             hasLockedVocal = true
         }
     }
 
-    private fun tryGlobalResync(): Boolean {
-        val m = recentVoicedPitches.size
-        if (m < 8 || totalFrames <= m + 20) return false
-        val seq = recentVoicedPitches.toDoubleArray()
-
-        var bestIdx = -1
-        var bestScore = 999.0
-        var bestRawErr = 999.0
-        val maxEnd = min(totalFrames - m, currentFrame + 600)
-
-        var start = currentFrame
-        while (start < maxEnd) {
-            var voicedCount = 0
-            var errSum = 0.0
-            for (k in 0 until m) {
-                val rp = refPitches[start + k]
-                val rv = refVoiced[start + k] > 0.35 && rp > 0.0
-                if (rv) {
-                    voicedCount++
-                    val d = abs(seq[k] - rp)
-                    val mod12 = d % 12.0
-                    val oct = min(mod12, 12.0 - mod12)
-                    errSum += min(d, oct + 1.0)
-                }
-            }
-            if (voicedCount >= m * 0.65) {
-                val rawErr = errSum / voicedCount
-                val score = rawErr + 0.0025 * (start - currentFrame)
-                if (score < bestScore) {
-                    bestScore = score
-                    bestRawErr = rawErr
-                    bestIdx = start + m - 1
-                }
-            }
-            start += 2
-        }
-
-        if (bestIdx >= 0 && bestRawErr < 1.3) {
-            currentFrame = bestIdx
-            accumulatedCosts.fill(50.0)
-            accumulatedCosts[bestIdx] = 0.0
-            mismatchStreak = 0
-            return true
-        }
-        return false
-    }
-
     fun step(
         liveMidi: Double,
         liveVoiced: Boolean
     ): Triple<Int, Double, Double> {
-        if (totalFrames == 0) return Triple(0, 0.0, 0.0)
+        if (totalFrames == 0) return Triple(0, 0.0, 0.75)
 
-        if (liveVoiced) {
-            recentVoicedPitches.addLast(liveMidi)
-            if (recentVoicedPitches.size > 16) recentVoicedPitches.removeFirst()
+        val refExpectsVocal = isReferenceVocalExpected(currentFrame)
 
-            if (!hasLockedVocal) {
-                if (currentFrame < firstVocalFrame - 10) {
-                    tryVocalEntryLock(liveMidi)
-                } else {
-                    hasLockedVocal = true
-                }
+        // 1. If we are in an instrumental passage (intro / interlude) and singer hasn't locked ahead,
+        // advance steadily at 1.0x so the accompaniment plays through the instrumental bars cleanly.
+        if (!refExpectsVocal && !liveVoiced) {
+            fractionalFrame = min((totalFrames - 1).toDouble(), fractionalFrame + 1.0)
+            currentFrame = fractionalFrame.roundToInt().coerceIn(0, totalFrames - 1)
+            accumulatedCosts.fill(50.0)
+            accumulatedCosts[currentFrame] = 0.0
+            confidence = max(0.70, confidence * 0.995)
+            val refTime = if (currentFrame < refTimes.size) refTimes[currentFrame] else duration
+            return Triple(currentFrame, refTime, confidence)
+        }
+
+        if (liveVoiced && !hasLockedVocal) {
+            if (currentFrame < firstVocalFrame - 8) {
+                tryVocalEntryLock(liveMidi)
+            } else {
+                hasLockedVocal = true
             }
         }
 
-        val wStart = max(0, currentFrame - 8)
+        // 2. Monotonic forward window [currentFrame .. currentFrame + windowSizeFrames]
+        // Never allow wStart < currentFrame (prevents backward jumping!).
+        val wStart = currentFrame
         val wEnd = min(totalFrames, currentFrame + windowSizeFrames)
-        val winLen = wEnd - wStart
+        val winLen = max(1, wEnd - wStart)
         val localCosts = frameCosts(liveMidi, liveVoiced, wStart, wEnd)
 
         val effStay = if (!liveVoiced) 0.0 else stayPenalty
-        val effStep = if (!liveVoiced) 0.12 else stepPenalty
-        val effSkip = if (!liveVoiced) 0.30 else skipPenalty
+        val effStep = if (!liveVoiced) 0.14 else stepPenalty
+        val effSkip = if (!liveVoiced) 0.35 else skipPenalty
 
         val newWin = DoubleArray(winLen)
         var minCost = Double.MAX_VALUE
@@ -206,8 +190,9 @@ class OnlineScoreFollower(
             val prevStay = accumulatedCosts[j] + effStay
             val prevStep = if (j > 0) accumulatedCosts[j - 1] + effStep else 1e5
             val prevSkip = if (j > 1) accumulatedCosts[j - 2] + effSkip else 1e5
-            val prevLeap = if (j > 2) accumulatedCosts[j - 3] + effSkip * 3.0 else 1e5
-            val v = localCosts[idx] + minOf(prevStay, prevStep, prevSkip, prevLeap)
+            // Small distance bias keeps argmin anchored near the wavefront unless strong match pulls it
+            val distBias = idx * 0.018
+            val v = localCosts[idx] + minOf(prevStay, prevStep, prevSkip) + distBias
             newWin[idx] = v
             if (v < minCost) minCost = v
         }
@@ -229,46 +214,42 @@ class OnlineScoreFollower(
             accumulatedCosts[wStart + idx] = newWin[idx]
         }
 
-        var bestJ = wStart + bestLocalIdx
-        var bestLocalCost = localCosts[bestLocalIdx]
-
-        if (liveVoiced) {
-            if (bestLocalCost > 0.55) {
-                mismatchStreak++
-                if (mismatchStreak >= 25 && tryGlobalResync()) {
-                    bestJ = currentFrame
-                    bestLocalCost = 0.1
-                }
-            } else {
-                mismatchStreak = 0
-            }
+        // Clamp per-hop frame advance to at most 2 frames (~2.0x real-time speed)
+        // so noisy mic frames can NEVER teleport across bars.
+        val rawAdvance = if (liveVoiced) {
+            bestLocalIdx.coerceIn(0, 2)
+        } else {
+            0
         }
+        val bestJ = (currentFrame + rawAdvance).coerceIn(0, totalFrames - 1)
+        val bestLocalCost = localCosts[bestJ - wStart]
 
         val sharpnessConf = if (winLen > 2) {
             val spread = (sumWin / winLen) - bestWinVal
-            1.0 / (1.0 + exp(-2.0 * (spread - 1.2)))
+            1.0 / (1.0 + exp(-2.0 * (spread - 1.0)))
         } else {
-            0.5
+            0.65
         }
         val matchConf = 1.0 - bestLocalCost
-        val rawConf = 0.6 * sharpnessConf + 0.4 * matchConf
+        val rawConf = 0.55 * sharpnessConf + 0.45 * matchConf
 
         if (liveVoiced) {
-            confidence = 0.80 * confidence + 0.20 * rawConf
+            confidence = 0.85 * confidence + 0.15 * rawConf
             frameHistory.addLast(bestJ)
             if (frameHistory.size > 40) {
                 frameHistory.removeFirst()
                 val deltaRef = frameHistory.last() - frameHistory.first()
                 val rawRatio = deltaRef.toDouble() / max(1, frameHistory.size - 1)
-                if (rawRatio in 0.3..2.2) {
-                    estimatedTempoRatio = 0.9 * estimatedTempoRatio + 0.1 * rawRatio
+                if (rawRatio in 0.70..1.35) {
+                    estimatedTempoRatio = 0.92 * estimatedTempoRatio + 0.08 * rawRatio
                 }
             }
         } else {
-            confidence = max(0.35, confidence * 0.985)
+            confidence = max(0.55, confidence * 0.992)
         }
 
         currentFrame = bestJ
+        fractionalFrame = bestJ.toDouble()
         val refTime = if (bestJ < refTimes.size) refTimes[bestJ] else duration
         return Triple(bestJ, refTime, confidence.coerceIn(0.0, 1.0))
     }
@@ -283,10 +264,11 @@ class OnlineScoreFollower(
         }
         val idx = lo.coerceIn(0, totalFrames - 1)
         currentFrame = idx
+        fractionalFrame = idx.toDouble()
         accumulatedCosts.fill(50.0)
         accumulatedCosts[idx] = 0.0
         hasLockedVocal = true
-        mismatchStreak = 0
+        frameHistory.clear()
     }
 
     fun getProgressPercent(): Float {

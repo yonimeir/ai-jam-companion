@@ -115,32 +115,57 @@ class JamEngineUnitTest {
     }
 
     @Test
-    fun scoreFollowerLocksAndJumpsCleanly() {
+    fun scoreFollowerMonotonicAndAdvancesThroughInstrumentalIntro() {
         val map = buildSyntheticSongMap()
         val follower = OnlineScoreFollower(map)
 
-        val (idx, _, conf) = follower.step(liveMidi = 60.0, liveVoiced = true)
-        assertTrue("Expected vocal lock >= 35, got $idx", idx >= 35)
-        assertTrue(conf in 0.0..1.0)
+        // 1. During instrumental intro (frames 0..39), follower should advance smoothly even with silence
+        var prevTime = 0.0
+        repeat(42) {
+            val (_, refTime, _) = follower.step(liveMidi = 0.0, liveVoiced = false)
+            assertTrue("Score follower must never jump backward ($refTime < $prevTime)", refTime >= prevTime)
+            prevTime = refTime
+        }
+        assertTrue("Expected follower to reach end of instrumental intro (~0.9s), got $prevTime", prevTime >= 0.85)
+
+        // 2. Now sing through the verse with occasional pitch jitter and breath pauses — must stay strictly monotonic
+        for (step in 0 until 150) {
+            val isBreath = step in 55..65
+            val sungMidi = when {
+                isBreath -> 0.0
+                step < 90 -> 60.0 + (step % 3 - 1) * 0.35
+                else -> 64.0 + (step % 3 - 1) * 0.35
+            }
+            val (_, refTime, conf) = follower.step(liveMidi = sungMidi, liveVoiced = !isBreath)
+            assertTrue("Monotonic violation at step $step: $refTime < $prevTime", refTime >= prevTime)
+            assertTrue("Max forward step per hop exceeded: ${refTime - prevTime}", (refTime - prevTime) < 0.08)
+            assertTrue(conf in 0.0..1.0)
+            prevTime = refTime
+        }
 
         follower.jumpToTime(6.0)
         assertTrue(follower.getProgressPercent() > 50f)
     }
 
     @Test
-    fun harmonicStateMachineHandlesVampAndTransitions() {
+    fun harmonicStateMachineHandlesVampAndSameHarmonySmoothly() {
         val map = buildSyntheticSongMap()
         val hsm = HarmonicStateMachine(map, confidenceThreshold = 0.55)
 
+        // Within Bar 1 (C major), moving across beats must stay in PLAYING mode (never CONFIDENCE_WAIT)
+        val beat2 = hsm.update(refTime = 0.7, confidence = 0.85, isVoiced = true, dt = 0.023, refExpectsVocal = false)
+        assertEquals(EngineMode.PLAYING, beat2.engineMode)
+        assertEquals("C", beat2.chord)
+
         // Manual vamp hold
         hsm.forceVampHold = true
-        val held = hsm.update(refTime = 3.0, confidence = 0.9, isVoiced = true, dt = 0.023)
+        val held = hsm.update(refTime = 3.0, confidence = 0.9, isVoiced = true, dt = 0.023, refExpectsVocal = true)
         assertEquals(EngineMode.VAMPING, held.engineMode)
 
         // Release vamp hold and confirm transition to Am (refTime = 3.0)
         hsm.forceVampHold = false
-        hsm.update(refTime = 3.0, confidence = 0.9, isVoiced = true, dt = 0.023)
-        val confirmed = hsm.update(refTime = 3.0, confidence = 0.9, isVoiced = true, dt = 0.023)
+        hsm.update(refTime = 3.0, confidence = 0.9, isVoiced = true, dt = 0.023, refExpectsVocal = true)
+        val confirmed = hsm.update(refTime = 3.0, confidence = 0.9, isVoiced = true, dt = 0.023, refExpectsVocal = true)
         assertEquals(EngineMode.PLAYING, confirmed.engineMode)
         assertEquals("Am", confirmed.chord)
     }
@@ -170,61 +195,107 @@ class JamEngineUnitTest {
     }
 
     @Test
-    fun realtimeTrackerAndMidiExportProduceValidSmf() {
+    fun realtimeTrackerSteadyClockAndDiagnosticLoggerWorkCleanly() {
         val map = buildSyntheticSongMap()
-        val tracker = RealtimeJamTracker(map, includeDrums = true)
-        val sr = 22050
-        val chunk = FloatArray(512) { i -> (0.35 * sin(2.0 * PI * 261.63 * i / sr)).toFloat() }
+        com.aijam.companion.util.DiagnosticLogger.clear()
+        com.aijam.companion.util.DiagnosticLogger.onSessionStart("DEMO", map.metadata.title)
 
-        repeat(8) {
-            tracker.processAudioBuffer(chunk)
+        val tracker = RealtimeJamTracker(map, includeDrums = true)
+        var prevTime = 0.0
+        var beatsTriggered = 0
+        repeat(120) {
+            val res = tracker.stepSteadyClock(dtSec = 512.0 / 22050.0, speedMultiplier = 1.0)
+            assertTrue("Steady clock must be monotonic", res.refTimeSec >= prevTime)
+            if (res.triggeredNotes.isNotEmpty()) beatsTriggered++
+            prevTime = res.refTimeSec
         }
 
+        assertTrue("Expected at least 4 steady beats triggered, got $beatsTriggered", beatsTriggered >= 4)
         assertTrue(tracker.scheduledTimeline.isNotEmpty())
         val midiBytes = MidiExporter.buildMidiBytes(tracker.scheduledTimeline, tracker.bpm)
         assertTrue(midiBytes.size > 32)
-        // Check 'MThd' header and 'MTrk' chunk
         assertEquals('M'.code.toByte(), midiBytes[0])
         assertEquals('T'.code.toByte(), midiBytes[1])
         assertEquals('h'.code.toByte(), midiBytes[2])
         assertEquals('d'.code.toByte(), midiBytes[3])
-        val text = String(midiBytes, Charsets.ISO_8859_1)
-        assertTrue(text.contains("MTrk"))
+
+        val report = com.aijam.companion.util.DiagnosticLogger.buildFullReport(
+            songMap = map,
+            liveState = com.aijam.companion.model.LiveJamState(
+                isRunning = true,
+                currentChord = tracker.lastStatus?.chord ?: "C",
+                currentBar = tracker.lastStatus?.bar ?: 1,
+                currentBeat = tracker.lastStatus?.beat ?: 1,
+                refTimeSec = prevTime
+            )
+        )
+        assertTrue(report.contains("=== AI Jam Companion — Diagnostic Report ==="))
+        assertTrue(report.contains("backward=0.00s"))
     }
 
     @Test
-    fun offlineAnalyzerProcessesSyntheticAudio() {
+    fun offlineAnalyzerProcessesArpeggiatedPianoBalladStableChords() {
         val sr = 22050
         val durSec = 8.0
         val totalSamples = (sr * durSec).toInt()
         val samples = FloatArray(totalSamples)
 
-        // 120 BPM pulse + C major -> A minor harmonic progression + melody
+        // Simulate an arpeggiated piano ballad (like "Great Expectations"):
+        // 120 BPM (0.5s per beat, 2.0s per bar):
+        // First 4.0s (2 bars): arpeggiated C major (C3 -> G3 -> C4 -> E4) + sustained pad + vocal melody
+        // Next 4.0s (2 bars): arpeggiated A minor (A2 -> E3 -> A3 -> C4) + sustained pad + vocal melody
         val beatSec = 0.5
         for (i in 0 until totalSamples) {
             val t = i.toDouble() / sr
-            val chordFreqs = if (t < 4.0) listOf(130.81, 261.63, 329.63, 392.00) else listOf(110.0, 220.0, 261.63, 329.63)
+            val isFirstHalf = t < 4.0
+            val beatIdx = ((t / beatSec).toInt()) % 4
+            val arpFreq = if (isFirstHalf) {
+                when (beatIdx) {
+                    0 -> 130.81 // C3
+                    1 -> 196.00 // G3
+                    2 -> 261.63 // C4
+                    else -> 329.63 // E4
+                }
+            } else {
+                when (beatIdx) {
+                    0 -> 110.00 // A2
+                    1 -> 164.81 // E3
+                    2 -> 220.00 // A3
+                    else -> 261.63 // C4
+                }
+            }
+            val chordTriad = if (isFirstHalf) {
+                listOf(130.81, 261.63, 329.63, 392.00)
+            } else {
+                listOf(110.0, 220.0, 261.63, 329.63)
+            }
             val beatPhase = (t % beatSec) / beatSec
-            val pulseEnv = if (beatPhase < 0.25) 1.0 else 0.35
-            var sum = 0.0
-            for (f in chordFreqs) sum += sin(2.0 * PI * f * t)
-            // Add vocal melody in middle register
-            sum += 0.9 * sin(2.0 * PI * 440.0 * t)
+            val pulseEnv = if (beatPhase < 0.25) 1.0 else 0.40
+            var sum = 0.7 * sin(2.0 * PI * arpFreq * t)
+            for (f in chordTriad) sum += 0.35 * sin(2.0 * PI * f * t)
+            // Foreground vocal melody with harmonics after 1.0s intro
+            if (t >= 1.0) {
+                val vocalF0 = if (isFirstHalf) 523.25 else 440.0
+                sum += 0.65 * sin(2.0 * PI * vocalF0 * t) + 0.30 * sin(2.0 * PI * 2 * vocalF0 * t)
+            }
             samples[i] = (0.14 * pulseEnv * sum).toFloat()
         }
 
         val map = OfflineSongAnalyzer.analyze(
             samples = samples,
             sampleRate = sr,
-            id = "synth_test",
-            title = "Synthetic C-Am",
+            id = "synth_ballad_test",
+            title = "Arpeggiated Piano Ballad",
             artist = "Test"
         )
         assertTrue(map.metadata.bpm in 58.0..175.0)
         assertTrue(map.chords.isNotEmpty())
         assertTrue(map.states.isNotEmpty())
+        // Verify bar chords are stable (at most 2 distinct chords per bar)
+        assertTrue(map.states.all { it.subChords.distinct().size <= 2 })
         assertTrue(map.sections.isNotEmpty())
         assertTrue(map.vocalAnchor.times.size == map.vocalAnchor.midiNotes.size)
+        assertTrue(com.aijam.companion.util.DiagnosticLogger.lastAnalysisReport.isNotBlank())
     }
 
     @Test
@@ -264,5 +335,11 @@ class JamEngineUnitTest {
         assertEquals(22, demo.states.size)
         assertTrue(demo.vocalAnchor.times.size > 1000)
         assertTrue(demo.lyrics.isNotEmpty())
+        // Verify intro frames (t < 9.0s) have zeroed vocal anchor so intro plays instrumentally
+        val introIdx = demo.vocalAnchor.times.indexOfFirst { it >= 5.0 }
+        if (introIdx >= 0) {
+            assertEquals(0.0, demo.vocalAnchor.voicedProb[introIdx], 1e-6)
+        }
     }
 }
+
