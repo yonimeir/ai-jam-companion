@@ -162,19 +162,17 @@ def extract_pitch_contour(
             rms_db: vocal energy level in decibels
     """
     # 1. Foreground vocal isolation (removes repeating piano/drums/bass)
-    from offline_pipeline.chord_detector import chunked_hpss_harmonic
     if isolate_vocals:
-        y_vocal = isolate_foreground_vocals(y, sr)
+        y_harm = isolate_foreground_vocals(y, sr)
         if save_vocals_path:
             import soundfile as sf
             os.makedirs(os.path.dirname(os.path.abspath(save_vocals_path)), exist_ok=True)
-            peak = float(np.max(np.abs(y_vocal))) if len(y_vocal) > 0 else 0.0
-            y_save = (y_vocal / peak * 0.9) if peak > 1e-6 else y_vocal
+            peak = float(np.max(np.abs(y_harm))) if len(y_harm) > 0 else 0.0
+            y_save = (y_harm / peak * 0.9) if peak > 1e-6 else y_harm
             sf.write(save_vocals_path, y_save.astype(np.float32), sr)
             del y_save
-        y_harm = chunked_hpss_harmonic(y_vocal, sr)
-        del y_vocal
     else:
+        from offline_pipeline.chord_detector import chunked_hpss_harmonic
         if save_vocals_path:
             import soundfile as sf
             os.makedirs(os.path.dirname(os.path.abspath(save_vocals_path)), exist_ok=True)
@@ -198,6 +196,7 @@ def extract_pitch_contour(
 
     # 3. Compute RMS energy envelope on isolated vocal signal
     rms = librosa.feature.rms(y=y_harm, frame_length=frame_length, hop_length=hop_length)[0]
+    del y_harm
     rms_db = 20.0 * np.log10(np.maximum(rms, 1e-5))
 
     # Gate very quiet bleed as unvoiced (e.g. residual accompaniment during instrumental intro)

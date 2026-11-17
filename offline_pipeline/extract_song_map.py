@@ -12,10 +12,11 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.parse
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Callable, Dict, Any, List, Optional, Tuple
 
 # Add parent directory to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -257,6 +258,55 @@ def download_audio_from_url(url: str, output_dir: str) -> str:
     return audio_path
 
 
+def _load_audio_low_mem(audio_file: str, target_sr: int = 22050) -> Tuple[np.ndarray, int]:
+    """
+    Loads audio as mono float32 at target_sr using minimal Python RAM.
+    If the input is already a mono WAV at target_sr, reads directly via soundfile.
+    Otherwise uses ffmpeg (if available) to decode & resample out-of-process before reading,
+    falling back to librosa.load if needed.
+    """
+    try:
+        info = sf.info(audio_file)
+        if info.samplerate == target_sr and info.channels == 1:
+            y, sr = sf.read(audio_file, dtype="float32", always_2d=False)
+            return np.ascontiguousarray(y, dtype=np.float32), int(sr)
+    except Exception:
+        pass
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        tmp_wav = None
+        try:
+            fd, tmp_wav = tempfile.mkstemp(prefix="ai_jam_pcm_", suffix=".wav")
+            os.close(fd)
+            res = subprocess.run(
+                [
+                    ffmpeg_bin, "-y", "-v", "error",
+                    "-i", audio_file,
+                    "-ac", "1", "-ar", str(target_sr),
+                    "-acodec", "pcm_s16le",
+                    tmp_wav,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=90,
+            )
+            if res.returncode == 0 and os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 44:
+                y, sr = sf.read(tmp_wav, dtype="float32", always_2d=False)
+                return np.ascontiguousarray(y, dtype=np.float32), int(sr)
+        except Exception:
+            pass
+        finally:
+            if tmp_wav and os.path.exists(tmp_wav):
+                try:
+                    os.remove(tmp_wav)
+                except OSError:
+                    pass
+
+    y, sr = librosa.load(audio_file, sr=target_sr, mono=True, dtype=np.float32)
+    return y, int(sr)
+
+
 def generate_song_map(
     audio_path_or_url: str,
     output_json_path: Optional[str] = None,
@@ -264,11 +314,19 @@ def generate_song_map(
     artist: str = "Unknown Artist",
     target_sr: int = 22050,
     save_vocals_path: Optional[str] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Main pipeline function: Processes audio (local file or YouTube/web URL/share text)
     and generates complete song state map.
     """
+    def _report(stage: str):
+        if progress_cb:
+            try:
+                progress_cb(stage)
+            except Exception:
+                pass
+
     temp_dir = None
     audio_file = audio_path_or_url
     media_meta: Dict[str, Any] = {}
@@ -276,6 +334,7 @@ def generate_song_map(
     try:
         extracted_url = extract_media_url(audio_path_or_url) if not os.path.exists(audio_path_or_url) else None
         if extracted_url:
+            _report("מוריד אודיו מהקישור...")
             print(f"[*] Downloading audio from URL: {extracted_url} ...")
             temp_dir = tempfile.mkdtemp(prefix="ai_jam_dl_")
             audio_file, media_meta = download_audio_with_metadata(extracted_url, temp_dir)
@@ -289,24 +348,28 @@ def generate_song_map(
         if not os.path.isfile(audio_file):
             raise FileNotFoundError(f"Audio file not found: {audio_file}")
 
+        _report("טוען ומפענח קובץ אודיו...")
         print(f"[*] Loading audio file: {audio_file} (resampling to {target_sr} Hz)...")
-        y, sr = librosa.load(audio_file, sr=target_sr, mono=True)
+        y, sr = _load_audio_low_mem(audio_file, target_sr=target_sr)
         duration = float(len(y) / sr)
         print(f"[✓] Audio loaded: {duration:.2f} seconds ({len(y)} samples)")
 
         # 1. Harmonic and Chord Analysis
+        _report("מזהה BPM ואקורדים...")
         print("[*] Extracting harmony, BPM, and chord sequence...")
         chords_list, bpm, beat_times = extract_chords_from_audio(y, sr)
         gc.collect()
         print(f"[✓] Detected BPM: {bpm:.1f}, Chords count: {len(chords_list)}")
 
         # 2. Song Structural Segmentation
+        _report("מזהה מבנה השיר (בית / פזמון)...")
         print("[*] Segmenting song structure (Intro, Verse, Chorus, Outro)...")
         sections = segment_song_structure(y, sr, beat_times)
         gc.collect()
         print(f"[✓] Detected {len(sections)} sections: {[s['name'] for s in sections]}")
 
         # 3. Vocal Pitch Contour (F0 reference anchor)
+        _report("מפריד שירה ומחלץ קו מלודיה (pYIN)...")
         print("[*] Extracting vocal pitch curve and energy contour via pYIN...")
         vocal_anchor = extract_pitch_contour(y, sr, save_vocals_path=save_vocals_path)
         del y
