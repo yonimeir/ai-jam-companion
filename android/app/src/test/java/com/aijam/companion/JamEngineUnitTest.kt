@@ -327,19 +327,32 @@ class JamEngineUnitTest {
     }
 
     @Test
-    fun bundledDemoAssetParsesCleanly() {
+    fun bundledDemoAssetAndGreatExpectationsPresetParseCleanly() {
         val assetFile = java.io.File("src/main/assets/demo_ballad_map.json")
-        if (!assetFile.exists()) return
-        val demo = SongMapJson.fromJson(assetFile.readText(), fallbackId = "demo_ballad")
-        assertEquals("Pop Ballad Standard", demo.metadata.title)
-        assertEquals(22, demo.states.size)
-        assertTrue(demo.vocalAnchor.times.size > 1000)
-        assertTrue(demo.lyrics.isNotEmpty())
-        // Verify intro frames (t < 9.0s) have zeroed vocal anchor so intro plays instrumentally
-        val introIdx = demo.vocalAnchor.times.indexOfFirst { it >= 5.0 }
-        if (introIdx >= 0) {
-            assertEquals(0.0, demo.vocalAnchor.voicedProb[introIdx], 1e-6)
+        if (assetFile.exists()) {
+            val demo = SongMapJson.fromJson(assetFile.readText(), fallbackId = "demo_ballad")
+            assertEquals("Great Expectations", demo.metadata.title)
+            assertEquals("Sienna Spiro", demo.metadata.artist)
+            assertEquals(55, demo.states.size)
+            assertTrue(demo.sections.any { "פתיח" in it.label })
+            assertTrue(demo.sections.any { "פזמון" in it.label })
+            assertTrue(demo.lyrics.size >= 40)
+            assertEquals("Bm", demo.states.first().chord)
+            // Verify intro frames (t = 5.0s) are unvoiced (< 0.2) so intro plays instrumentally
+            val introIdx = demo.vocalAnchor.times.indexOfFirst { it >= 5.0 }
+            if (introIdx >= 0) {
+                assertTrue(demo.vocalAnchor.voicedProb[introIdx] < 0.2)
+            }
         }
+
+        assertTrue(com.aijam.companion.data.GreatExpectationsPreset.matchesSong("Sienna Spiro - Great Expectations (Official Audio)"))
+        val preset = com.aijam.companion.data.GreatExpectationsPreset.buildSongMap(targetDurationSec = 173.0)
+        assertEquals(55, preset.states.size)
+        assertEquals("Bm", preset.states[0].chord)
+        assertEquals("Gmaj7", preset.states[2].chord)
+        assertEquals("G", preset.states[12].chord)
+        assertEquals("F#7", preset.states[14].chord)
+        assertTrue(preset.lyrics.first().text.contains("In my head"))
     }
 }
 

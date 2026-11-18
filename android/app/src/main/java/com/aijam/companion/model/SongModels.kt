@@ -87,6 +87,12 @@ enum class InputMode(val labelHe: String) {
     DEMO("זמר דמו")
 }
 
+enum class AudioOutputMode(val labelHe: String, val subtitleHe: String) {
+    ORIGINAL_TRACK("שיר מקורי", "השמעת השיר המקורי בסנכרון חי"),
+    PIANO_ONLY("פסנתר בלבד", "ליווי פסנתר כנף אקוסטי נקי"),
+    MIXED("מיקס משולב", "שיר מקורי + הדגשת פסנתר")
+}
+
 data class ScheduledNoteEvent(
     val notes: List<Int>,
     val startBeat: Double,
@@ -98,18 +104,22 @@ data class ScheduledNoteEvent(
 data class LiveJamState(
     val isRunning: Boolean = false,
     val inputMode: InputMode = InputMode.DEMO,
+    val audioOutputMode: AudioOutputMode = AudioOutputMode.PIANO_ONLY,
+    val hasOriginalAudio: Boolean = false,
     val engineMode: EngineMode = EngineMode.PLAYING,
-    val currentChord: String = "C",
-    val chordQuality: String = "Major Triad",
-    val chordNotes: List<Int> = listOf(60, 64, 67),
+    val currentChord: String = "Bm",
+    val nextChord: String = "A",
+    val chordQuality: String = "סי מינור",
+    val chordNotes: List<Int> = listOf(59, 62, 66),
     val currentBar: Int = 1,
-    val totalBars: Int = 22,
+    val totalBars: Int = 55,
     val currentBeat: Int = 1,
-    val currentSection: String = "Intro",
+    val currentSection: String = "פתיח • Intro",
     val refTimeSec: Double = 0.0,
-    val durationSec: Double = 53.8,
+    val durationSec: Double = 173.0,
     val progressPct: Float = 0f,
-    val confidence: Float = 0.5f,
+    val secondsToVocalEntry: Float = 0f,
+    val confidence: Float = 0.9f,
     val tempoRatio: Float = 1.0f,
     val singerF0Hz: Float = 0f,
     val singerNoteName: String = "---",

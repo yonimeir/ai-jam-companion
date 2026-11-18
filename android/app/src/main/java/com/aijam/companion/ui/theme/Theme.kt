@@ -10,22 +10,25 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
+/**
+ * Warm Velvet & Steinway Amber Studio Color Palette (inspired by Apple Music Sing & Moises Studio).
+ */
 object StageColors {
-    val Obsidian = Color(0xFF07090F)
-    val DeepSlate = Color(0xFF0C111D)
-    val Charcoal = Color(0xFF111827)
-    val Elevated = Color(0xFF182135)
-    val Hairline = Color(0xFF24304A)
+    val Obsidian = Color(0xFF09080D)
+    val DeepSlate = Color(0xFF121018)
+    val Charcoal = Color(0xFF1A1723)
+    val Elevated = Color(0xFF242031)
+    val Hairline = Color(0xFF302A40)
 
-    val Gold = Color(0xFFF5B041)
-    val Brass = Color(0xFFD98B2B)
-    val Cyan = Color(0xFF38BDF8)
+    val Gold = Color(0xFFF6B93B)
+    val Brass = Color(0xFFE58E26)
+    val Cyan = Color(0xFF7DD3FC)
     val Emerald = Color(0xFF34D399)
-    val Coral = Color(0xFFFB7185)
+    val Coral = Color(0xFFF472B6)
 
-    val TextPrimary = Color(0xFFF8FAFC)
-    val TextSecondary = Color(0xFFCBD5E1)
-    val TextMuted = Color(0xFF7D8EA8)
+    val TextPrimary = Color(0xFFFAF7F2)
+    val TextSecondary = Color(0xFFD8D3E2)
+    val TextMuted = Color(0xFF8E86A0)
 }
 
 private val MidnightStageColorScheme = darkColorScheme(
@@ -48,14 +51,14 @@ private val StageTypography = Typography(
     displayLarge = TextStyle(
         fontFamily = FontFamily.SansSerif,
         fontWeight = FontWeight.Black,
-        fontSize = 44.sp,
-        letterSpacing = (-1).sp,
+        fontSize = 46.sp,
+        letterSpacing = (-1.2).sp,
         color = StageColors.TextPrimary
     ),
     headlineMedium = TextStyle(
         fontFamily = FontFamily.SansSerif,
-        fontWeight = FontWeight.Bold,
-        fontSize = 22.sp,
+        fontWeight = FontWeight.ExtraBold,
+        fontSize = 23.sp,
         color = StageColors.TextPrimary
     ),
     titleMedium = TextStyle(
@@ -74,7 +77,7 @@ private val StageTypography = Typography(
         fontFamily = FontFamily.SansSerif,
         fontWeight = FontWeight.Medium,
         fontSize = 11.sp,
-        letterSpacing = 0.4.sp,
+        letterSpacing = 0.3.sp,
         color = StageColors.TextMuted
     )
 )

@@ -8,14 +8,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoFixHigh
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.FileOpen
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -42,11 +45,16 @@ import com.aijam.companion.ui.theme.StageColors
 @Composable
 fun LyricsEditorSheet(
     songMap: SongMap,
+    isFetchingOnline: Boolean = false,
+    onFetchOnlineLyrics: (String) -> Unit = {},
     onPickLrcFile: () -> Unit,
     onSaveLyricsText: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var searchQuery by remember(songMap.metadata.id) {
+        mutableStateOf("${songMap.metadata.artist} ${songMap.metadata.title}".trim())
+    }
     var text by remember(songMap.metadata.id, songMap.lyrics) {
         mutableStateOf(
             if (songMap.lyrics.isNotEmpty()) LyricsParser.toLrcString(songMap.lyrics) else ""
@@ -81,24 +89,80 @@ fun LyricsEditorSheet(
                 )
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "הדבק מילים רגילות (יסונכרנו אוטומטית על התיבות) או פורמט LRC מתוזמן [mm:ss.xx].",
-                fontSize = 12.sp,
-                color = StageColors.TextMuted
-            )
+            Spacer(modifier = Modifier.height(10.dp))
 
-            Spacer(modifier = Modifier.height(12.dp))
+            // Online Synced Lyrics Search Row (LRCLIB)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    placeholder = {
+                        Text(
+                            text = "שם השיר והאמן לחיפוש LRC...",
+                            color = StageColors.TextMuted,
+                            fontSize = 12.sp
+                        )
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = StageColors.Charcoal,
+                        unfocusedContainerColor = StageColors.Charcoal,
+                        focusedBorderColor = StageColors.Cyan,
+                        unfocusedBorderColor = StageColors.Hairline,
+                        focusedTextColor = StageColors.TextPrimary,
+                        unfocusedTextColor = StageColors.TextPrimary
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                )
+
+                Button(
+                    onClick = { onFetchOnlineLyrics(searchQuery) },
+                    enabled = !isFetchingOnline && searchQuery.isNotBlank(),
+                    modifier = Modifier.height(54.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = StageColors.Cyan,
+                        contentColor = StageColors.Obsidian
+                    )
+                ) {
+                    if (isFetchingOnline) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = StageColors.Obsidian,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Rounded.CloudDownload,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "חפש LRC",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
 
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(210.dp),
+                    .height(190.dp),
                 placeholder = {
                     Text(
-                        text = "[00:09.33] שורה ראשונה בבית...\n[00:14.14] שורה שנייה...",
+                        text = "[00:13.00] In my head, you lay down next to me...\n[00:16.20] Kiss my lips, hold me carefully...",
                         color = StageColors.TextMuted.copy(alpha = 0.65f),
                         fontSize = 13.sp
                     )

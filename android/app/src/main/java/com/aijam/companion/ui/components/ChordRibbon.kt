@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
@@ -32,7 +33,7 @@ import com.aijam.companion.model.BarState
 import com.aijam.companion.ui.theme.StageColors
 
 /**
- * Auto-scrolling horizontal bar progression ribbon (forced LTR) with tap-to-jump.
+ * Compact auto-scrolling horizontal Bar & Chord progression ribbon (LTR) with tap-to-jump.
  */
 @Composable
 fun ChordRibbon(
@@ -55,33 +56,40 @@ fun ChordRibbon(
             state = listState,
             modifier = modifier.fillMaxWidth(),
             contentPadding = PaddingValues(horizontal = 2.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             items(states, key = { it.bar }) { barState ->
                 val isCurrent = barState.bar == currentBar
                 val isPast = barState.bar < currentBar
+                val secColor = sectionAccentColor(barState.section)
+                val distinctChords = barState.subChords.distinct()
+                val chordLabel = if (distinctChords.size > 1) {
+                    distinctChords.joinToString("·")
+                } else {
+                    barState.chord
+                }
 
                 val containerColor = when {
-                    isCurrent -> StageColors.Gold.copy(alpha = 0.16f)
-                    isPast -> StageColors.Obsidian
+                    isCurrent -> secColor.copy(alpha = 0.20f)
+                    isPast -> StageColors.DeepSlate.copy(alpha = 0.55f)
                     else -> StageColors.Charcoal
                 }
                 val borderColor = when {
-                    isCurrent -> StageColors.Gold
-                    else -> StageColors.Hairline
+                    isCurrent -> secColor
+                    else -> StageColors.Hairline.copy(alpha = 0.55f)
                 }
 
                 Surface(
                     modifier = Modifier
-                        .width(82.dp)
-                        .clip(RoundedCornerShape(14.dp))
+                        .width(74.dp)
+                        .clip(RoundedCornerShape(12.dp))
                         .clickable { onJumpToBar(barState.bar) },
-                    shape = RoundedCornerShape(14.dp),
+                    shape = RoundedCornerShape(12.dp),
                     color = containerColor,
-                    border = BorderStroke(if (isCurrent) 1.5.dp else 1.dp, borderColor)
+                    border = BorderStroke(if (isCurrent) 1.5.dp else 0.8.dp, borderColor)
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                         horizontalAlignment = Alignment.Start
                     ) {
                         Row(
@@ -91,22 +99,17 @@ fun ChordRibbon(
                         ) {
                             Text(
                                 text = "B${barState.bar}",
-                                color = if (isCurrent) StageColors.Gold else StageColors.TextMuted,
-                                fontSize = 10.sp,
+                                color = if (isCurrent) secColor else StageColors.TextMuted,
+                                fontSize = 9.sp,
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace
                             )
-                            Text(
-                                text = barState.section.replace("_", " ").take(7),
-                                color = StageColors.TextMuted.copy(alpha = 0.8f),
-                                fontSize = 9.sp
-                            )
                         }
-                        Spacer(modifier = Modifier.padding(top = 3.dp))
+                        Spacer(modifier = Modifier.height(1.dp))
                         Text(
-                            text = barState.chord,
-                            color = if (isCurrent) StageColors.Gold else StageColors.TextPrimary,
-                            fontSize = 16.sp,
+                            text = chordLabel,
+                            color = if (isCurrent) StageColors.TextPrimary else StageColors.TextSecondary,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.ExtraBold
                         )
                     }

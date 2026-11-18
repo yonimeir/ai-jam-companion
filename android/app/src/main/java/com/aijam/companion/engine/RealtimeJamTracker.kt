@@ -380,15 +380,8 @@ class RealtimeJamTracker(
         return Triple(triggeredNotes, durationBeats, drumHits)
     }
 
-    private fun formatChordQuality(chord: String): String = when {
-        chord.endsWith("maj7") -> "Major 7th"
-        chord.endsWith("m7") -> "Minor 7th"
-        chord.endsWith("7") -> "Dominant 7th"
-        chord.endsWith("sus4") -> "Suspended 4th"
-        chord.endsWith("dim") -> "Diminished"
-        chord.endsWith("m") -> "Minor Triad"
-        else -> "Major Triad"
-    }
+    private fun formatChordQuality(chord: String): String =
+        VoicingEngine.describeChordQuality(chord)
 
     fun processAudioBuffer(audioChunk: FloatArray): TrackerStepResult? {
         for (sample in audioChunk) ringBuffer.add(sample)

@@ -12,11 +12,14 @@ import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aijam.companion.data.LyricsParser
+import com.aijam.companion.data.OnlineLyricsService
 import com.aijam.companion.data.SongLibraryRepository
 import com.aijam.companion.engine.MidiExporter
 import com.aijam.companion.engine.RealtimeJamTracker
 import com.aijam.companion.engine.TrackerStepResult
+import com.aijam.companion.engine.VoicingEngine
 import com.aijam.companion.model.AccompanimentStyle
+import com.aijam.companion.model.AudioOutputMode
 import com.aijam.companion.model.InputMode
 import com.aijam.companion.model.LiveJamState
 import com.aijam.companion.model.SongMap
@@ -43,18 +46,18 @@ data class AnalysisUiState(
 )
 
 /**
- * Coordinates the live jam engine, AudioRecord microphone capture, steady Demo/Practice playback,
- * low-latency AudioTrack accompaniment synth, on-device MP3/WAV analysis, lyrics, MIDI, and diagnostics.
+ * Coordinates the live jam engine, AudioRecord microphone capture, non-clashing Original Track
+ * vs. Sampled Acoustic Grand Piano accompaniment playback, online LRC lyrics sync, and diagnostics.
  */
 class JamSessionController(application: Application) : AndroidViewModel(application) {
 
     private val repository = SongLibraryRepository(application.applicationContext)
-    private val synth = PolyphonicAudioSynth().apply { start() }
+    private val synth = PolyphonicAudioSynth(application.applicationContext).apply { start() }
 
     private val _library = MutableStateFlow<List<SongMap>>(emptyList())
     val library: StateFlow<List<SongMap>> = _library.asStateFlow()
 
-    private val _songMap = MutableStateFlow(repository.loadDemoSong())
+    private val _songMap = MutableStateFlow(repository.listSongs().first())
     val songMap: StateFlow<SongMap> = _songMap.asStateFlow()
 
     private val _liveState = MutableStateFlow(initialLiveState(_songMap.value))
@@ -63,10 +66,11 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     private val _style = MutableStateFlow(AccompanimentStyle.BALLAD_ARPEGGIO)
     val style: StateFlow<AccompanimentStyle> = _style.asStateFlow()
 
-    private val _includeDrums = MutableStateFlow(true)
+    // Disabled by default so piano ballads play pure, lush sampled grand piano without synthetic drum noise
+    private val _includeDrums = MutableStateFlow(false)
     val includeDrums: StateFlow<Boolean> = _includeDrums.asStateFlow()
 
-    private val _reverbMix = MutableStateFlow(0.26f)
+    private val _reverbMix = MutableStateFlow(0.28f)
     val reverbMix: StateFlow<Float> = _reverbMix.asStateFlow()
 
     private val _confidenceThreshold = MutableStateFlow(0.55f)
@@ -75,8 +79,14 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     private val _simSpeed = MutableStateFlow(1.0f)
     val simSpeed: StateFlow<Float> = _simSpeed.asStateFlow()
 
+    private val _audioOutputMode = MutableStateFlow(defaultOutputModeForSong(_songMap.value))
+    val audioOutputMode: StateFlow<AudioOutputMode> = _audioOutputMode.asStateFlow()
+
     private val _hearSinger = MutableStateFlow(true)
     val hearSinger: StateFlow<Boolean> = _hearSinger.asStateFlow()
+
+    private val _isFetchingOnlineLyrics = MutableStateFlow(false)
+    val isFetchingOnlineLyrics: StateFlow<Boolean> = _isFetchingOnlineLyrics.asStateFlow()
 
     private val _analysisState = MutableStateFlow(AnalysisUiState())
     val analysisState: StateFlow<AnalysisUiState> = _analysisState.asStateFlow()
@@ -97,30 +107,54 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     @Volatile private var drumPulseLevel = 0f
 
     init {
-        _library.value = repository.listSongs()
+        val allSongs = repository.listSongs()
+        _library.value = allSongs
         synth.reverbMix = _reverbMix.value
         DiagnosticLogger.log(
             "INIT",
-            "App initialized with song='${_songMap.value.metadata.title}' (${_songMap.value.metadata.bpm} BPM, ${_songMap.value.metadata.totalBars} bars)"
+            "App initialized with song='${_songMap.value.metadata.title}' by '${_songMap.value.metadata.artist}' (${_songMap.value.metadata.bpm} BPM, ${_songMap.value.metadata.totalBars} bars, lyrics=${_songMap.value.lyrics.size})"
         )
+    }
+
+    private fun hasLocalAudioFile(song: SongMap): Boolean {
+        val p = song.metadata.audioPath ?: return false
+        val f = File(p)
+        return f.exists() && f.length() > 0L
+    }
+
+    private fun defaultOutputModeForSong(song: SongMap): AudioOutputMode {
+        return if (hasLocalAudioFile(song)) {
+            AudioOutputMode.ORIGINAL_TRACK
+        } else {
+            AudioOutputMode.PIANO_ONLY
+        }
     }
 
     private fun initialLiveState(song: SongMap): LiveJamState {
         val firstState = song.states.firstOrNull()
-        val firstSection = song.sections.firstOrNull()?.label ?: "Intro"
+        val secondState = song.states.getOrNull(1)
+        val firstSection = song.sections.firstOrNull()?.label ?: "פתיח • Intro"
+        val hasAudio = hasLocalAudioFile(song)
+        val outMode = defaultOutputModeForSong(song)
+        val firstChord = firstState?.chord ?: "Bm"
+        val nextChord = secondState?.chord ?: firstChord
         return LiveJamState(
             isRunning = false,
             inputMode = InputMode.DEMO,
-            currentChord = firstState?.chord ?: "C",
-            chordQuality = if (firstState?.chord?.endsWith("m") == true) "Minor Triad" else "Major Triad",
-            chordNotes = firstState?.notes ?: listOf(60, 64, 67),
+            audioOutputMode = outMode,
+            hasOriginalAudio = hasAudio,
+            currentChord = firstChord,
+            nextChord = nextChord,
+            chordQuality = VoicingEngine.describeChordQuality(firstChord),
+            chordNotes = firstState?.notes ?: listOf(59, 62, 66),
             currentBar = 1,
             totalBars = song.metadata.totalBars.coerceAtLeast(1),
             currentBeat = 1,
             currentSection = firstSection,
             refTimeSec = 0.0,
             durationSec = song.metadata.duration.coerceAtLeast(1.0),
-            progressPct = 0f
+            progressPct = 0f,
+            secondsToVocalEntry = computeSecondsToVocalEntry(song, 0.0)
         )
     }
 
@@ -155,6 +189,37 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         DiagnosticLogger.log("MODE", "Switched input mode to ${mode.name}")
         _liveState.value = _liveState.value.copy(inputMode = mode)
         if (wasRunning) startJam()
+    }
+
+    fun setAudioOutputMode(mode: AudioOutputMode) {
+        if (mode == AudioOutputMode.ORIGINAL_TRACK && !hasLocalAudioFile(_songMap.value)) {
+            _statusMessage.value = "ייבא את קובץ השיר (MP3/M4A) מהמכשיר כדי להאזין להקלטה המקורית"
+            return
+        }
+        _audioOutputMode.value = mode
+        _hearSinger.value = (mode != AudioOutputMode.PIANO_ONLY)
+        if (mode == AudioOutputMode.ORIGINAL_TRACK) {
+            synth.panic()
+        }
+        applyMediaPlayerVolume(activeMediaPlayer)
+        _liveState.value = _liveState.value.copy(audioOutputMode = mode)
+        DiagnosticLogger.log("AUDIO_MODE", "Switched audio output mode to ${mode.name}")
+    }
+
+    fun selectPianoAccompanimentMode() {
+        val wasMic = _liveState.value.inputMode == InputMode.MIC
+        if (wasMic) {
+            setInputMode(InputMode.DEMO)
+        }
+        setAudioOutputMode(AudioOutputMode.PIANO_ONLY)
+    }
+
+    fun selectOriginalTrackMode() {
+        val wasMic = _liveState.value.inputMode == InputMode.MIC
+        if (wasMic) {
+            setInputMode(InputMode.DEMO)
+        }
+        setAudioOutputMode(AudioOutputMode.ORIGINAL_TRACK)
     }
 
     fun setStyle(newStyle: AccompanimentStyle) {
@@ -193,17 +258,40 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
 
     fun setHearSinger(enabled: Boolean) {
         _hearSinger.value = enabled
-        runCatching {
-            val mp = activeMediaPlayer
-            if (mp != null) {
-                val vol = if (enabled) 0.52f else 0f
-                mp.setVolume(vol, vol)
-            }
+        val newMode = if (enabled && hasLocalAudioFile(_songMap.value)) {
+            AudioOutputMode.ORIGINAL_TRACK
+        } else {
+            AudioOutputMode.PIANO_ONLY
         }
+        _audioOutputMode.value = newMode
+        _liveState.value = _liveState.value.copy(audioOutputMode = newMode)
+        applyMediaPlayerVolume(activeMediaPlayer)
+    }
+
+    private fun applyMediaPlayerVolume(mp: MediaPlayer?) {
+        if (mp == null) return
+        runCatching {
+            val vol = when {
+                tracker.stateMachine.forceVampHold -> 0f
+                _audioOutputMode.value == AudioOutputMode.ORIGINAL_TRACK -> 1.0f
+                _audioOutputMode.value == AudioOutputMode.MIXED -> 0.65f
+                else -> 0f
+            }
+            mp.setVolume(vol, vol)
+        }
+    }
+
+    private fun shouldTriggerSynthPiano(): Boolean {
+        if (_liveState.value.inputMode == InputMode.MIC) return true
+        if (!hasLocalAudioFile(_songMap.value)) return true
+        // When user is holding VAMP, play the grand piano loop even if in ORIGINAL_TRACK mode
+        if (tracker.stateMachine.forceVampHold) return true
+        return _audioOutputMode.value != AudioOutputMode.ORIGINAL_TRACK
     }
 
     fun setForceVampHold(hold: Boolean) {
         tracker.stateMachine.forceVampHold = hold
+        applyMediaPlayerVolume(activeMediaPlayer)
         _liveState.value = _liveState.value.copy(isVampHolding = hold)
         DiagnosticLogger.log("VAMP", "Manual Vamp Hold set to $hold")
     }
@@ -234,7 +322,10 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         keyExpiryMs.clear()
         beatPulseLevel = 0f
         drumPulseLevel = 0f
-        DiagnosticLogger.log("SESSION", "Stopped playback at t=${"%.2f".format(_liveState.value.refTimeSec)}s (Bar ${_liveState.value.currentBar})")
+        DiagnosticLogger.log(
+            "SESSION",
+            "Stopped playback at t=${"%.2f".format(_liveState.value.refTimeSec)}s (Bar ${_liveState.value.currentBar})"
+        )
         _liveState.value = _liveState.value.copy(
             isRunning = false,
             isVoiced = false,
@@ -253,7 +344,10 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         tracker.reset()
         pitchHistory.clear()
         targetHistory.clear()
-        _liveState.value = initialLiveState(_songMap.value).copy(inputMode = _liveState.value.inputMode)
+        _liveState.value = initialLiveState(_songMap.value).copy(
+            inputMode = _liveState.value.inputMode,
+            audioOutputMode = _audioOutputMode.value
+        )
         if (wasRunning) startJam()
     }
 
@@ -263,46 +357,64 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     }
 
     fun jumpToTime(timeSec: Double) {
-        val target = timeSec.coerceIn(0.0, _songMap.value.metadata.duration)
+        val song = _songMap.value
+        val target = timeSec.coerceIn(0.0, song.metadata.duration)
         tracker.jumpToTime(target)
         runCatching {
             activeMediaPlayer?.seekTo((target * 1000.0).toInt())
         }
-        val state = _songMap.value.states.firstOrNull { target >= it.startTime && target < it.endTime }
-            ?: _songMap.value.states.minByOrNull { kotlin.math.abs(it.startTime - target) }
-        val pct = if (_songMap.value.metadata.duration > 0.0) {
-            ((target / _songMap.value.metadata.duration) * 100.0).toFloat().coerceIn(0f, 100f)
+        val state = song.states.firstOrNull { target >= it.startTime && target < it.endTime }
+            ?: song.states.minByOrNull { kotlin.math.abs(it.startTime - target) }
+        val sectionLabel = song.sections.firstOrNull { target >= it.startTime && target <= it.endTime }?.label
+            ?: _liveState.value.currentSection
+        val pct = if (song.metadata.duration > 0.0) {
+            ((target / song.metadata.duration) * 100.0).toFloat().coerceIn(0f, 100f)
         } else 0f
 
-        DiagnosticLogger.log("SEEK", "User seeked to ${"%.2f".format(target)}s (Bar ${state?.bar ?: 1}, Chord ${state?.chord ?: "?"})")
+        val curChord = state?.chord ?: _liveState.value.currentChord
+        val nextChord = lookupNextChord(song, state?.bar ?: 1, curChord)
+        DiagnosticLogger.log(
+            "SEEK",
+            "User seeked to ${"%.2f".format(target)}s (Bar ${state?.bar ?: 1}, Section '$sectionLabel', Chord $curChord)"
+        )
         _liveState.value = _liveState.value.copy(
             refTimeSec = target,
             progressPct = pct,
             currentBar = state?.bar ?: _liveState.value.currentBar,
-            currentChord = state?.chord ?: _liveState.value.currentChord,
-            chordNotes = state?.notes ?: _liveState.value.chordNotes
+            currentSection = sectionLabel,
+            currentChord = curChord,
+            nextChord = nextChord,
+            chordQuality = VoicingEngine.describeChordQuality(curChord),
+            chordNotes = state?.notes ?: _liveState.value.chordNotes,
+            secondsToVocalEntry = computeSecondsToVocalEntry(song, target)
         )
     }
 
     fun tapPianoKey(midiNote: Int) {
-        synth.triggerPianoNotes(listOf(midiNote), velocity = 92, durationSec = 0.85)
+        synth.triggerPianoNotes(listOf(midiNote), velocity = 92, durationSec = 1.15)
         val now = System.currentTimeMillis()
-        keyExpiryMs[midiNote] = now + 260L
+        keyExpiryMs[midiNote] = now + 320L
         _liveState.value = _liveState.value.copy(activeKeysMidi = keyExpiryMs.keys.toSet())
     }
 
     fun selectSong(song: SongMap) {
         stopJam()
         _songMap.value = song
+        val outMode = defaultOutputModeForSong(song)
+        _audioOutputMode.value = outMode
+        _hearSinger.value = (outMode != AudioOutputMode.PIANO_ONLY)
         tracker = createTracker(song)
         pitchHistory.clear()
         targetHistory.clear()
-        _liveState.value = initialLiveState(song).copy(inputMode = _liveState.value.inputMode)
+        _liveState.value = initialLiveState(song).copy(
+            inputMode = _liveState.value.inputMode,
+            audioOutputMode = outMode
+        )
         DiagnosticLogger.log(
             "SONG",
-            "Selected song '${song.metadata.title}' (${song.metadata.bpm} BPM, ${song.metadata.totalBars} bars, audioPath=${song.metadata.audioPath != null})"
+            "Selected song '${song.metadata.title}' (${song.metadata.bpm} BPM, ${song.metadata.totalBars} bars, audioPath=${song.metadata.audioPath != null}, outputMode=$outMode)"
         )
-        _statusMessage.value = "נטען: ${song.metadata.title}"
+        _statusMessage.value = "נטען: ${song.metadata.title} — ${song.metadata.artist}"
     }
 
     fun deleteSong(songId: String) {
@@ -322,11 +434,42 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         _library.value = repository.listSongs()
         if (_songMap.value.metadata.id == saved.metadata.id) {
             _songMap.value = saved
+            tracker = createTracker(saved)
         }
         _statusMessage.value = if (aligned.isEmpty()) {
             "המילים נוקו"
         } else {
-            "סונכרנו ${aligned.size} שורות לשיר"
+            "סונכרנו ${aligned.size} שורות מילים וחלקי שיר!"
+        }
+    }
+
+    fun fetchOnlineLyricsForCurrentSong(customQuery: String = "") {
+        if (_isFetchingOnlineLyrics.value) return
+        val song = _songMap.value
+        val searchTitle = customQuery.ifBlank { song.metadata.title }
+        val searchArtist = if (customQuery.isBlank()) song.metadata.artist else ""
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _isFetchingOnlineLyrics.value = true
+            try {
+                val res = OnlineLyricsService.fetchLyricsOnline(
+                    title = searchTitle,
+                    artist = searchArtist,
+                    durationSec = song.metadata.duration
+                )
+                if (res != null && res.rawLrcOrPlain.isNotBlank()) {
+                    val aligned = LyricsParser.parseAndAlign(res.rawLrcOrPlain, song)
+                    val saved = repository.updateLyrics(song, aligned)
+                    _library.value = repository.listSongs()
+                    _songMap.value = saved
+                    tracker = createTracker(saved)
+                    _statusMessage.value = "נמצאו וסונכרנו ${aligned.size} שורות (${res.trackName})"
+                } else {
+                    _statusMessage.value = "לא נמצאו מילים מתוזמנות אונליין עבור '$searchTitle'"
+                }
+            } finally {
+                _isFetchingOnlineLyrics.value = false
+            }
         }
     }
 
@@ -380,7 +523,8 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
                 _library.value = repository.listSongs()
                 _analysisState.value = AnalysisUiState(isAnalyzing = false, progress = 1f)
                 selectSong(saved)
-                _statusMessage.value = "נותח בהצלחה: ${saved.metadata.title} (${saved.metadata.bpm.toInt()} BPM)"
+                val lyricsNote = if (saved.lyrics.isNotEmpty()) " + ${saved.lyrics.size} שורות מילים מסונכרנות" else ""
+                _statusMessage.value = "מוכן לנגינה: ${saved.metadata.title}$lyricsNote"
             } catch (e: Exception) {
                 DiagnosticLogger.log("ERROR", "Audio import failed: ${e.javaClass.simpleName}: ${e.message}")
                 _analysisState.value = AnalysisUiState(
@@ -423,7 +567,6 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         var visualPhase = 0.0
         val twoPi = 2.0 * PI
 
-        // If this song was imported from an audio file on the device, prepare MediaPlayer for optional synced playback
         val localAudioFile = _songMap.value.metadata.audioPath
             ?.let { File(it) }
             ?.takeIf { it.exists() && it.length() > 0L }
@@ -436,8 +579,6 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
                     prepare()
                     val startMs = (_liveState.value.refTimeSec * 1000.0).toInt()
                     if (startMs > 0) seekTo(startMs)
-                    val vol = if (_hearSinger.value) 0.52f else 0f
-                    setVolume(vol, vol)
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && _simSpeed.value != 1.0f) {
                         playbackParams = PlaybackParams().setSpeed(_simSpeed.value)
                     }
@@ -448,17 +589,16 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
             }.getOrNull()
         } else null
         activeMediaPlayer = mp
+        applyMediaPlayerVolume(mp)
 
         try {
             while (coroutineContextIsActive()) {
                 val stepStartNs = System.nanoTime()
                 val speed = _simSpeed.value.toDouble()
 
-                // Pause original audio track if user is holding VAMP
                 if (mp != null) {
                     runCatching {
-                        val vol = if (_hearSinger.value && !tracker.stateMachine.forceVampHold) 0.52f else 0f
-                        mp.setVolume(vol, vol)
+                        applyMediaPlayerVolume(mp)
                         if (tracker.stateMachine.forceVampHold && mp.isPlaying) {
                             mp.pause()
                         } else if (!tracker.stateMachine.forceVampHold && !mp.isPlaying) {
@@ -477,7 +617,6 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
                     externalTimeSec = extSec
                 )
 
-                // Generate clean visual waveform for the UI oscilloscope
                 val waveFreq = if (res.isVoiced && res.singerF0Hz > 65.0) {
                     res.singerF0Hz
                 } else {
@@ -570,28 +709,34 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
     private fun handleStepResult(res: TrackerStepResult, rawAudio: FloatArray) {
         val secPerBeat = 60.0 / tracker.bpm
         val nowMs = System.currentTimeMillis()
+        val playSynth = shouldTriggerSynthPiano()
 
         if (res.triggeredNotes.isNotEmpty() && res.durationBeats > 0.0) {
             val durSec = res.durationBeats * secPerBeat
-            synth.triggerPianoNotes(res.triggeredNotes, res.pianoVelocity, durSec)
-            val holdMs = (durSec * 650.0).toLong().coerceIn(180L, 1200L)
+            if (playSynth) {
+                val vel = if (_audioOutputMode.value == AudioOutputMode.MIXED) {
+                    (res.pianoVelocity * 0.72).toInt()
+                } else {
+                    res.pianoVelocity
+                }
+                synth.triggerPianoNotes(res.triggeredNotes, vel, durSec)
+            }
+            val holdMs = (durSec * 650.0).toLong().coerceIn(200L, 1400L)
             res.triggeredNotes.forEach { keyExpiryMs[it] = nowMs + holdMs }
             beatPulseLevel = 1f
         } else {
             beatPulseLevel *= 0.86f
         }
 
-        if (res.drumHits.isNotEmpty()) {
+        if (res.drumHits.isNotEmpty() && playSynth) {
             synth.triggerDrums(res.drumHits)
             drumPulseLevel = 1f
         } else {
             drumPulseLevel *= 0.82f
         }
 
-        // Prune expired lit keys
         keyExpiryMs.entries.removeAll { it.value < nowMs }
 
-        // Downsample 512-sample audio slice into 128-point waveform
         val wave = FloatArray(128)
         val stride = max(1, rawAudio.size / 128)
         for (i in 0 until 128) {
@@ -599,26 +744,33 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
             wave[i] = rawAudio[idx]
         }
 
-        // Lookup target melody pitch at refTimeSec for the visual Pitch Horizon
+        val song = _songMap.value
         val targetMidi = lookupTargetMidi(res.refTimeSec)
         pitchHistory.addLast(if (res.isVoiced) res.singerMidi.toFloat() else 0f)
         targetHistory.addLast(targetMidi)
         if (pitchHistory.size > 64) pitchHistory.removeFirst()
         if (targetHistory.size > 64) targetHistory.removeFirst()
 
+        val nextChord = lookupNextChord(song, res.bar, res.chord)
+        val secToVocal = computeSecondsToVocalEntry(song, res.refTimeSec)
+
         _liveState.value = _liveState.value.copy(
             isRunning = true,
+            audioOutputMode = _audioOutputMode.value,
+            hasOriginalAudio = hasLocalAudioFile(song),
             engineMode = res.engineMode,
             currentChord = res.chord,
+            nextChord = nextChord,
             chordQuality = res.quality,
             chordNotes = res.chordNotes,
             currentBar = res.bar,
-            totalBars = _songMap.value.metadata.totalBars.coerceAtLeast(1),
+            totalBars = song.metadata.totalBars.coerceAtLeast(1),
             currentBeat = res.beat,
             currentSection = res.section,
             refTimeSec = res.refTimeSec,
-            durationSec = _songMap.value.metadata.duration.coerceAtLeast(1.0),
+            durationSec = song.metadata.duration.coerceAtLeast(1.0),
             progressPct = res.progressPct,
+            secondsToVocalEntry = secToVocal,
             confidence = res.confidence.toFloat(),
             tempoRatio = res.tempoRatio.toFloat(),
             singerF0Hz = res.singerF0Hz.toFloat(),
@@ -635,6 +787,27 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
             drumPulse = drumPulseLevel,
             isVampHolding = tracker.stateMachine.forceVampHold
         )
+    }
+
+    private fun lookupNextChord(song: SongMap, currentBar: Int, currentChord: String): String {
+        for (b in currentBar..song.states.size) {
+            val st = song.states.getOrNull(b - 1) ?: continue
+            for (sub in st.subChords) {
+                if (sub != currentChord) return sub
+            }
+            if (st.chord != currentChord) return st.chord
+        }
+        return song.states.getOrNull(currentBar)?.chord ?: currentChord
+    }
+
+    private fun computeSecondsToVocalEntry(song: SongMap, refTimeSec: Double): Float {
+        if (song.lyrics.isEmpty()) return 0f
+        // Check if we are currently inside an active lyric line
+        val active = song.lyrics.any { refTimeSec >= it.startTime - 0.25 && refTimeSec <= it.endTime + 0.4 }
+        if (active) return 0f
+        val upcoming = song.lyrics.firstOrNull { it.startTime > refTimeSec } ?: return 0f
+        val waitSec = (upcoming.startTime - refTimeSec).toFloat()
+        return if (waitSec in 0.1f..15.0f) waitSec else 0f
     }
 
     private fun lookupTargetMidi(refTime: Double): Float {
@@ -654,4 +827,3 @@ class JamSessionController(application: Application) : AndroidViewModel(applicat
         super.onCleared()
     }
 }
-

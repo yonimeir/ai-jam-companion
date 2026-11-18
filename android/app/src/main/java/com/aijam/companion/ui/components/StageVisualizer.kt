@@ -1,12 +1,7 @@
 package com.aijam.companion.ui.components
 
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -25,7 +20,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,7 +30,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
@@ -51,29 +44,27 @@ import androidx.compose.ui.unit.sp
 import com.aijam.companion.model.EngineMode
 import com.aijam.companion.model.LiveJamState
 import com.aijam.companion.ui.theme.StageColors
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.sin
+import kotlin.math.ceil
 
 /**
- * 60fps Audio-Reactive Stage Canvas combining:
- * - Harmonic halo rings pulsing with beat & drum energy
- * - Radial spectrum petals reactive to live waveform
- * - Live vocal waveform trace
- * - Melodic Pitch Horizon comparing Target Melody contour vs. Singer Pitch Trail
- * - Sculptural Chord Emblem + 4-Beat LED bar + Confidence/Dynamics meters
+ * Sleek Live Harmonic & Vocal Stage Deck (Apple Music Sing × Moises Studio aesthetic):
+ * - Sculptural Current Chord + Hebrew chord quality + Next Chord preview ("הבא: A")
+ * - 4-Beat visual pulse metronome & Bar counter
+ * - Smooth background Melodic Pitch Horizon & live vocal waveform
+ * - Vocal Entry Countdown banner ("כניסת שירה בעוד 3...") during instrumental intros/gaps
  */
 @Composable
 fun StageVisualizer(
     state: LiveJamState,
     modifier: Modifier = Modifier
 ) {
+    val sectionColor = sectionAccentColor(state.currentSection)
     val modeAccent by animateColorAsState(
         targetValue = when (state.engineMode) {
-            EngineMode.PLAYING -> StageColors.Gold
             EngineMode.VAMPING -> StageColors.Coral
             EngineMode.CONFIDENCE_WAIT -> StageColors.Cyan
+            EngineMode.PLAYING -> sectionColor
         },
         animationSpec = tween(320),
         label = "modeAccent"
@@ -81,118 +72,50 @@ fun StageVisualizer(
 
     val beatPulseAnim by animateFloatAsState(
         targetValue = if (state.isRunning) state.beatPulse else 0f,
-        animationSpec = spring(stiffness = 380f, dampingRatio = 0.65f),
+        animationSpec = spring(stiffness = 380f, dampingRatio = 0.68f),
         label = "beatPulse"
-    )
-    val drumPulseAnim by animateFloatAsState(
-        targetValue = if (state.isRunning) state.drumPulse else 0f,
-        animationSpec = spring(stiffness = 440f, dampingRatio = 0.7f),
-        label = "drumPulse"
-    )
-
-    val infiniteTransition = rememberInfiniteTransition(label = "stageSpin")
-    val ambientPhase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2f * PI).toFloat(),
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 9000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "ambientPhase"
     )
 
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        color = StageColors.Charcoal,
-        border = BorderStroke(1.dp, modeAccent.copy(alpha = 0.28f))
+        shape = RoundedCornerShape(22.dp),
+        color = StageColors.DeepSlate,
+        border = BorderStroke(1.dp, modeAccent.copy(alpha = 0.24f + 0.16f * beatPulseAnim))
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(232.dp)
+                .height(136.dp)
                 .background(
-                    Brush.radialGradient(
+                    Brush.horizontalGradient(
                         colors = listOf(
-                            modeAccent.copy(alpha = 0.14f + 0.12f * beatPulseAnim),
+                            modeAccent.copy(alpha = 0.14f + 0.10f * beatPulseAnim),
                             StageColors.DeepSlate,
                             StageColors.Obsidian
                         )
                     )
                 )
         ) {
-            // Musical canvas forced LTR so time/melody flows naturally left -> right
+            // Subtle background Melodic Pitch Horizon & Live Waveform (LTR)
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val w = size.width
                     val h = size.height
-                    val center = Offset(w * 0.5f, h * 0.45f)
-                    val baseRadius = minOf(w, h) * 0.29f
-
-                    // 1. Subtle Horizon Grid
-                    for (row in 1..3) {
-                        val y = h * (0.24f * row)
-                        drawLine(
-                            color = StageColors.Hairline.copy(alpha = 0.35f),
-                            start = Offset(0f, y),
-                            end = Offset(w, y),
-                            strokeWidth = 1f
-                        )
-                    }
-
-                    // 2. Reactive Concentric Harmonic Rings & Acoustic Petals
-                    val ringRadius = baseRadius + beatPulseAnim * 18.dp.toPx()
-                    drawCircle(
-                        color = modeAccent.copy(alpha = 0.16f + 0.22f * beatPulseAnim),
-                        radius = ringRadius * 1.28f,
-                        center = center,
-                        style = Stroke(width = 1.5.dp.toPx())
-                    )
-                    drawCircle(
-                        color = StageColors.Cyan.copy(alpha = 0.14f + 0.20f * drumPulseAnim),
-                        radius = ringRadius * 0.96f,
-                        center = center,
-                        style = Stroke(width = 1.2.dp.toPx())
-                    )
-
-                    val spokeCount = 36
-                    val wave = state.waveform
-                    for (i in 0 until spokeCount) {
-                        val angle = ambientPhase + (i.toFloat() / spokeCount) * (2f * PI.toFloat())
-                        val waveIdx = if (wave.isNotEmpty()) (i * wave.size / spokeCount) % wave.size else 0
-                        val energy = if (state.isRunning && wave.isNotEmpty()) {
-                            abs(wave[waveIdx]).coerceIn(0f, 1f)
-                        } else {
-                            0.08f
-                        }
-                        val innerR = ringRadius * 0.88f
-                        val outerR = innerR + (6f + energy * 34f + beatPulseAnim * 10f).dp.toPx()
-                        val sx = center.x + cos(angle) * innerR
-                        val sy = center.y + sin(angle) * innerR
-                        val ex = center.x + cos(angle) * outerR
-                        val ey = center.y + sin(angle) * outerR
-                        drawLine(
-                            color = modeAccent.copy(alpha = 0.22f + energy * 0.65f),
-                            start = Offset(sx, sy),
-                            end = Offset(ex, ey),
-                            strokeWidth = 2.2.dp.toPx(),
-                            cap = StrokeCap.Round
-                        )
-                    }
-
-                    // 3. Target Melody Contour (Warm Brass Dashed Curve) vs. Singer Pitch Trail (Electric Cyan)
                     val targets = state.targetPitchTrail
                     val singerPitches = state.pitchTrail
-                    val horizonTop = h * 0.12f
-                    val horizonBottom = h * 0.72f
-                    val minMidi = 45f
-                    val maxMidi = 81f
+                    val wave = state.waveform
+
+                    val horizonTop = h * 0.25f
+                    val horizonBottom = h * 0.85f
+                    val minMidi = 50f
+                    val maxMidi = 78f
 
                     fun midiToY(midi: Float): Float {
                         val norm = ((midi - minMidi) / (maxMidi - minMidi)).coerceIn(0f, 1f)
                         return horizonBottom - norm * (horizonBottom - horizonTop)
                     }
 
+                    // Target melody contour (subtle warm amber dashed curve)
                     if (targets.size >= 2) {
                         val targetPath = Path()
                         var started = false
@@ -212,15 +135,16 @@ fun StageVisualizer(
                         }
                         drawPath(
                             path = targetPath,
-                            color = StageColors.Gold.copy(alpha = 0.50f),
+                            color = StageColors.Gold.copy(alpha = 0.26f),
                             style = Stroke(
-                                width = 2.dp.toPx(),
+                                width = 1.8.dp.toPx(),
                                 cap = StrokeCap.Round,
-                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 8f), 0f)
                             )
                         )
                     }
 
+                    // Live singer pitch trail
                     if (singerPitches.size >= 2) {
                         val singerPath = Path()
                         var started = false
@@ -242,198 +166,230 @@ fun StageVisualizer(
                         }
                         drawPath(
                             path = singerPath,
-                            color = StageColors.Cyan,
+                            color = StageColors.Cyan.copy(alpha = 0.55f),
                             style = Stroke(
-                                width = 3.dp.toPx(),
+                                width = 2.4.dp.toPx(),
                                 cap = StrokeCap.Round,
                                 join = StrokeJoin.Round
                             )
                         )
                         lastPt?.let { tip ->
-                            val isLockedOnPitch = state.isVoiced &&
+                            val locked = state.isVoiced &&
                                 state.targetMidi > 20f &&
                                 abs(state.singerMidi - state.targetMidi) <= 1.8f
-                            val tipColor = if (isLockedOnPitch) StageColors.Emerald else StageColors.Cyan
+                            val tipColor = if (locked) StageColors.Emerald else StageColors.Cyan
                             drawCircle(
-                                color = tipColor.copy(alpha = 0.32f),
-                                radius = 11.dp.toPx(),
+                                color = tipColor.copy(alpha = 0.28f),
+                                radius = 9.dp.toPx(),
                                 center = tip
                             )
                             drawCircle(
                                 color = tipColor,
-                                radius = 4.5.dp.toPx(),
+                                radius = 4.dp.toPx(),
                                 center = tip
                             )
                         }
                     }
 
-                    // 4. Bottom Live Vocal Waveform Ribbon
+                    // Bottom delicate audio wave ribbon
                     if (wave.size >= 4) {
-                        val waveBaseY = h * 0.84f
+                        val baseY = h * 0.90f
                         val wavePath = Path()
                         val step = w / (wave.size - 1)
-                        val ampScale = 26.dp.toPx()
-                        wavePath.moveTo(0f, waveBaseY)
+                        val ampScale = 14.dp.toPx()
+                        wavePath.moveTo(0f, baseY)
                         for (i in wave.indices) {
                             val x = i * step
-                            val y = waveBaseY - wave[i].coerceIn(-1f, 1f) * ampScale
+                            val y = baseY - wave[i].coerceIn(-1f, 1f) * ampScale
                             wavePath.lineTo(x, y)
                         }
                         drawPath(
                             path = wavePath,
-                            color = if (state.isVoiced) StageColors.Cyan.copy(alpha = 0.85f)
-                            else StageColors.Hairline.copy(alpha = 0.8f),
-                            style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+                            color = modeAccent.copy(alpha = 0.32f),
+                            style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round)
                         )
                     }
                 }
             }
 
-            // Foreground HUD & Center Chord Emblem
+            // Foreground HUD content
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // Top Telemetry Row: Section + Bar/Total + Engine Mode Badge
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Surface(
-                        color = StageColors.Elevated.copy(alpha = 0.86f),
-                        shape = RoundedCornerShape(999.dp),
-                        border = BorderStroke(1.dp, StageColors.Hairline)
+                // Main Row: Current Chord -> Next Chord on one side, Beat Metronome & Section on the other
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "${state.currentSection} • תיבה ${state.currentBar}/${state.totalBars}",
-                            color = StageColors.TextSecondary,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                        )
-                    }
-
-                    Surface(
-                        color = modeAccent.copy(alpha = 0.16f),
-                        shape = RoundedCornerShape(999.dp),
-                        border = BorderStroke(1.dp, modeAccent.copy(alpha = 0.45f))
-                    ) {
+                        // Left: Current Chord + Next Chord Preview
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(modeAccent)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = state.engineMode.labelHe,
-                                color = modeAccent,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-                }
-
-                // Center Chord Emblem + Beat LEDs
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = state.currentChord,
-                        color = StageColors.TextPrimary,
-                        fontSize = 46.sp,
-                        fontWeight = FontWeight.Black,
-                        fontFamily = FontFamily.SansSerif,
-                        letterSpacing = (-1).sp
-                    )
-                    Text(
-                        text = state.chordQuality,
-                        color = modeAccent.copy(alpha = 0.88f),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    // 4-Beat LED bar (LTR)
-                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(7.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            for (beat in 1..4) {
-                                val isActive = state.currentBeat == beat
-                                Box(
-                                    modifier = Modifier
-                                        .size(if (isActive) 10.dp else 7.dp)
-                                        .clip(CircleShape)
-                                        .background(
-                                            when {
-                                                isActive && beat == 1 -> StageColors.Gold
-                                                isActive -> StageColors.Cyan
-                                                else -> StageColors.Hairline
-                                            }
-                                        )
+                            Column {
+                                Row(verticalAlignment = Alignment.Bottom) {
+                                    Text(
+                                        text = state.currentChord,
+                                        color = StageColors.TextPrimary,
+                                        fontSize = 42.sp,
+                                        fontWeight = FontWeight.Black,
+                                        fontFamily = FontFamily.SansSerif,
+                                        letterSpacing = (-1).sp,
+                                        lineHeight = 42.sp
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    // Next Chord Pill
+                                    Surface(
+                                        color = StageColors.Elevated.copy(alpha = 0.88f),
+                                        shape = RoundedCornerShape(10.dp),
+                                        border = BorderStroke(0.8.dp, StageColors.Hairline)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "הבא:",
+                                                color = StageColors.TextMuted,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                            Spacer(modifier = Modifier.width(5.dp))
+                                            Text(
+                                                text = state.nextChord,
+                                                color = StageColors.Gold,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.ExtraBold
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = state.chordQuality,
+                                    color = modeAccent,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
                                 )
                             }
                         }
+
+                        // Right: 4-Beat Visual Metronome + Bar & Pitch badge
+                        Column(horizontalAlignment = Alignment.End) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                for (beat in 1..4) {
+                                    val isActive = state.currentBeat == beat
+                                    val dotColor = when {
+                                        isActive && beat == 1 -> StageColors.Gold
+                                        isActive -> modeAccent
+                                        else -> StageColors.Elevated
+                                    }
+                                    Surface(
+                                        modifier = Modifier.size(if (isActive) 22.dp else 18.dp),
+                                        shape = CircleShape,
+                                        color = if (isActive) dotColor.copy(alpha = 0.24f) else StageColors.Elevated.copy(alpha = 0.6f),
+                                        border = BorderStroke(
+                                            width = if (isActive) 1.5.dp else 0.8.dp,
+                                            color = if (isActive) dotColor else StageColors.Hairline
+                                        )
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                text = "$beat",
+                                                color = if (isActive) dotColor else StageColors.TextMuted,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "תיבה ${state.currentBar} מתוך ${state.totalBars}",
+                                color = StageColors.TextSecondary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
 
-                // Bottom Telemetry Strip: Singer Pitch + Confidence + Dynamics
+                // Bottom Strip: Vocal Entry Countdown OR Current Section + Live Pitch status
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Singer Pitch readout
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = if (state.isVoiced) state.singerNoteName else "---",
-                            color = if (state.isVoiced) StageColors.Cyan else StageColors.TextMuted,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                        if (state.isVoiced && state.singerF0Hz > 0f) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "${state.singerF0Hz.toInt()}Hz",
-                                color = StageColors.TextMuted,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
+                    if (state.secondsToVocalEntry in 0.2f..14.0f) {
+                        val secsLeft = ceil(state.secondsToVocalEntry.toDouble()).toInt()
+                        Surface(
+                            color = StageColors.Gold.copy(alpha = 0.18f),
+                            shape = RoundedCornerShape(999.dp),
+                            border = BorderStroke(1.dp, StageColors.Gold.copy(alpha = 0.6f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(StageColors.Gold)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "כניסת שירה בעוד $secsLeft שניות...",
+                                    color = StageColors.TextPrimary,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
+                    } else {
+                        Text(
+                            text = state.currentSection,
+                            color = StageColors.TextSecondary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
 
-                    // Alignment Confidence & Tempo Ratio
+                    // Right side: Live vocal note or Audio Output Mode badge
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Column(horizontalAlignment = Alignment.End) {
+                        if (state.isVoiced && state.singerF0Hz > 0f) {
+                            Surface(
+                                color = StageColors.Cyan.copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(999.dp)
+                            ) {
+                                Text(
+                                    text = "🎤 ${state.singerNoteName}",
+                                    color = StageColors.Cyan,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
+                                )
+                            }
+                        } else {
                             Text(
-                                text = "דיוק ${(state.confidence * 100).toInt()}% • x${"%.2f".format(state.tempoRatio)}",
+                                text = state.audioOutputMode.labelHe,
                                 color = StageColors.TextMuted,
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            Spacer(modifier = Modifier.height(3.dp))
-                            LinearProgressIndicator(
-                                progress = { state.confidence.coerceIn(0f, 1f) },
-                                modifier = Modifier
-                                    .width(86.dp)
-                                    .height(4.dp)
-                                    .clip(RoundedCornerShape(999.dp)),
-                                color = if (state.confidence >= 0.55f) StageColors.Emerald else StageColors.Coral,
-                                trackColor = StageColors.Elevated
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium
                             )
                         }
                     }

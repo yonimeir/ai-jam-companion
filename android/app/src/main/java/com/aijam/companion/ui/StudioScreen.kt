@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -22,20 +23,19 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FileDownload
-import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Loop
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Piano
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material.icons.rounded.Stop
@@ -82,12 +82,14 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.aijam.companion.audio.JamSessionController
 import com.aijam.companion.model.AccompanimentStyle
+import com.aijam.companion.model.AudioOutputMode
 import com.aijam.companion.model.InputMode
 import com.aijam.companion.ui.components.ChordRibbon
 import com.aijam.companion.ui.components.DiagnosticsSheet
 import com.aijam.companion.ui.components.LyricsEditorSheet
 import com.aijam.companion.ui.components.LyricsTeleprompter
 import com.aijam.companion.ui.components.PianoKeyboard
+import com.aijam.companion.ui.components.SectionRoadmapBar
 import com.aijam.companion.ui.components.SongLibrarySheet
 import com.aijam.companion.ui.components.StageVisualizer
 import com.aijam.companion.ui.theme.StageColors
@@ -105,7 +107,8 @@ fun StudioScreen(controller: JamSessionController) {
     val reverbMix by controller.reverbMix.collectAsState()
     val confidenceThreshold by controller.confidenceThreshold.collectAsState()
     val simSpeed by controller.simSpeed.collectAsState()
-    val hearSinger by controller.hearSinger.collectAsState()
+    val audioOutputMode by controller.audioOutputMode.collectAsState()
+    val isFetchingOnlineLyrics by controller.isFetchingOnlineLyrics.collectAsState()
     val analysisState by controller.analysisState.collectAsState()
     val statusMessage by controller.statusMessage.collectAsState()
 
@@ -113,6 +116,7 @@ fun StudioScreen(controller: JamSessionController) {
     var showLyricsSheet by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
     var showDiagnosticsSheet by remember { mutableStateOf(false) }
+    var showPianoDrawer by remember { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(statusMessage) {
@@ -184,10 +188,13 @@ fun StudioScreen(controller: JamSessionController) {
         topBar = {
             StudioTopBar(
                 title = songMap.metadata.title,
+                artist = songMap.metadata.artist,
                 bpm = songMap.metadata.bpm,
                 isAnalyzing = analysisState.isAnalyzing,
+                showPianoDrawer = showPianoDrawer,
                 onOpenLibrary = { showLibrarySheet = true },
                 onOpenLyrics = { showLyricsSheet = true },
+                onTogglePianoDrawer = { showPianoDrawer = !showPianoDrawer },
                 onOpenDiagnostics = { showDiagnosticsSheet = true },
                 onOpenSettings = { showSettingsSheet = true }
             )
@@ -196,10 +203,23 @@ fun StudioScreen(controller: JamSessionController) {
             StageConsoleBar(
                 isRunning = liveState.isRunning,
                 inputMode = liveState.inputMode,
+                audioOutputMode = audioOutputMode,
+                hasOriginalAudio = liveState.hasOriginalAudio,
                 isVampHolding = liveState.isVampHolding,
+                refTimeSec = liveState.refTimeSec,
+                durationSec = liveState.durationSec,
+                progressPct = liveState.progressPct,
                 onToggleJam = { controller.toggleJam() },
+                onResetToStart = { controller.resetToStart() },
+                onSelectOriginalTrack = {
+                    if (liveState.hasOriginalAudio) {
+                        controller.selectOriginalTrackMode()
+                    } else {
+                        audioPickerLauncher.launch(arrayOf("audio/*"))
+                    }
+                },
+                onSelectPianoOnly = { controller.selectPianoAccompanimentMode() },
                 onSelectMic = { requestMicMode() },
-                onSelectDemo = { controller.setInputMode(InputMode.DEMO) },
                 onToggleVampHold = { controller.setForceVampHold(!liveState.isVampHolding) }
             )
         }
@@ -208,83 +228,48 @@ fun StudioScreen(controller: JamSessionController) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(horizontal = 14.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // 1. Live Audio-Reactive Stage Canvas
+            // 1. Interactive Song Structure Roadmap Strip (פתיח • בית 1 • פזמון 1 • בית 2 • גשר • סיום)
+            SectionRoadmapBar(
+                sections = songMap.sections,
+                currentBar = liveState.currentBar,
+                refTimeSec = liveState.refTimeSec,
+                onSelectSection = { section -> controller.jumpToTime(section.startTime) }
+            )
+
+            // 2. Live Harmonic & Vocal Stage Deck (Current Chord -> Next Chord, 4-Beat Metronome, Vocal Entry Countdown)
             StageVisualizer(state = liveState)
 
-            // 2. Song Progress + Time strip
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = formatSec(liveState.refTimeSec),
-                        color = StageColors.TextSecondary,
-                        fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    LinearProgressIndicator(
-                        progress = { (liveState.progressPct / 100f).coerceIn(0f, 1f) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(5.dp)
-                            .clip(RoundedCornerShape(999.dp)),
-                        color = StageColors.Gold,
-                        trackColor = StageColors.Elevated
-                    )
-                    Text(
-                        text = formatSec(liveState.durationSec),
-                        color = StageColors.TextMuted,
-                        fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    IconButton(
-                        onClick = { controller.resetToStart() },
-                        modifier = Modifier.size(28.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Replay,
-                            contentDescription = "חזור להתחלה",
-                            tint = StageColors.TextMuted,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                }
-            }
-
-            // 3. Synced Song Lyrics Teleprompter
+            // 3. Centerpiece Apple-Music-Sing Style Lead-Sheet Teleprompter (takes main screen height)
             LyricsTeleprompter(
                 lyrics = songMap.lyrics,
                 states = songMap.states,
+                sections = songMap.sections,
                 refTimeSec = liveState.refTimeSec,
                 engineMode = liveState.engineMode,
                 currentChord = liveState.currentChord,
                 onJumpToTime = { controller.jumpToTime(it) },
-                onOpenLyricsEditor = { showLyricsSheet = true }
+                onOpenLyricsEditor = { showLyricsSheet = true },
+                modifier = Modifier.weight(1f)
             )
 
-            // 4. Chord Progression Bar Ribbon
+            // 4. Compact Bar & Chord Progression Ribbon
             ChordRibbon(
                 states = songMap.states,
                 currentBar = liveState.currentBar,
                 onJumpToBar = { controller.jumpToBar(it) }
             )
 
-            // 5. Interactive 2-Octave Illuminated Stage Piano
-            PianoKeyboard(
-                activeKeysMidi = liveState.activeKeysMidi,
-                chordNotes = liveState.chordNotes,
-                onTapKey = { controller.tapPianoKey(it) }
-            )
-
-            Spacer(modifier = Modifier.height(6.dp))
+            // 5. Optional Collapsible 2-Octave Illuminated Grand Piano Keyboard
+            AnimatedVisibility(visible = showPianoDrawer) {
+                PianoKeyboard(
+                    activeKeysMidi = liveState.activeKeysMidi,
+                    chordNotes = liveState.chordNotes,
+                    onTapKey = { controller.tapPianoKey(it) }
+                )
+            }
         }
     }
 
@@ -304,6 +289,8 @@ fun StudioScreen(controller: JamSessionController) {
     if (showLyricsSheet) {
         LyricsEditorSheet(
             songMap = songMap,
+            isFetchingOnline = isFetchingOnlineLyrics,
+            onFetchOnlineLyrics = { query -> controller.fetchOnlineLyricsForCurrentSong(query) },
             onPickLrcFile = { lrcPickerLauncher.launch(arrayOf("text/*", "application/octet-stream", "*/*")) },
             onSaveLyricsText = { controller.updateSongLyrics(it) },
             onDismiss = { showLyricsSheet = false }
@@ -317,13 +304,14 @@ fun StudioScreen(controller: JamSessionController) {
             reverbMix = reverbMix,
             confidenceThreshold = confidenceThreshold,
             simSpeed = simSpeed,
-            hearSinger = hearSinger,
+            audioOutputMode = audioOutputMode,
+            hasOriginalAudio = liveState.hasOriginalAudio,
             onSelectStyle = { controller.setStyle(it) },
             onToggleDrums = { controller.setIncludeDrums(it) },
             onReverbChange = { controller.setReverbMix(it) },
             onConfidenceChange = { controller.setConfidenceThreshold(it) },
             onSimSpeedChange = { controller.setSimSpeed(it) },
-            onToggleHearSinger = { controller.setHearSinger(it) },
+            onSelectAudioOutputMode = { controller.setAudioOutputMode(it) },
             onExportMidi = {
                 val safeTitle = songMap.metadata.title.replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "ai_jam" }
                 midiExportLauncher.launch("${safeTitle}_live.mid")
@@ -352,10 +340,13 @@ fun StudioScreen(controller: JamSessionController) {
 @Composable
 private fun StudioTopBar(
     title: String,
+    artist: String,
     bpm: Double,
     isAnalyzing: Boolean,
+    showPianoDrawer: Boolean,
     onOpenLibrary: () -> Unit,
     onOpenLyrics: () -> Unit,
+    onTogglePianoDrawer: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -363,17 +354,16 @@ private fun StudioTopBar(
         modifier = Modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        // Brand + Song Selector Pill
         Row(
             modifier = Modifier
                 .weight(1f)
                 .clip(RoundedCornerShape(14.dp))
                 .clickable { onOpenLibrary() }
-                .padding(end = 8.dp),
+                .padding(end = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Surface(
@@ -397,8 +387,8 @@ private fun StudioTopBar(
                     Text(
                         text = title,
                         color = StageColors.TextPrimary,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.ExtraBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false)
@@ -411,7 +401,7 @@ private fun StudioTopBar(
                     )
                 }
                 Text(
-                    text = if (isAnalyzing) "מנתח שיר במכשיר..." else "${bpm.toInt()} BPM • מנוע אודיו מקומי",
+                    text = if (isAnalyzing) "מנתח שיר במכשיר..." else "$artist • ${bpm.toInt()} BPM",
                     color = if (isAnalyzing) StageColors.Cyan else StageColors.TextMuted,
                     fontSize = 11.sp,
                     maxLines = 1,
@@ -420,8 +410,7 @@ private fun StudioTopBar(
             }
         }
 
-        // Action icons: Library / Lyrics / Diagnostics / Settings
-        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
             IconButton(onClick = onOpenLibrary) {
                 Icon(
                     imageVector = Icons.Rounded.LibraryMusic,
@@ -432,14 +421,21 @@ private fun StudioTopBar(
             IconButton(onClick = onOpenLyrics) {
                 Icon(
                     imageVector = Icons.Rounded.Lyrics,
-                    contentDescription = "ערוך מילים",
+                    contentDescription = "מילים ו-LRC",
                     tint = StageColors.Cyan
+                )
+            }
+            IconButton(onClick = onTogglePianoDrawer) {
+                Icon(
+                    imageVector = Icons.Rounded.Piano,
+                    contentDescription = "מקלדת פסנתר",
+                    tint = if (showPianoDrawer) StageColors.Gold else StageColors.TextMuted
                 )
             }
             IconButton(onClick = onOpenDiagnostics) {
                 Icon(
                     imageVector = Icons.Rounded.BugReport,
-                    contentDescription = "לוגים ודיאגנוסטיקה",
+                    contentDescription = "דיאגנוסטיקה",
                     tint = StageColors.Brass
                 )
             }
@@ -458,150 +454,253 @@ private fun StudioTopBar(
 private fun StageConsoleBar(
     isRunning: Boolean,
     inputMode: InputMode,
+    audioOutputMode: AudioOutputMode,
+    hasOriginalAudio: Boolean,
     isVampHolding: Boolean,
+    refTimeSec: Double,
+    durationSec: Double,
+    progressPct: Float,
     onToggleJam: () -> Unit,
+    onResetToStart: () -> Unit,
+    onSelectOriginalTrack: () -> Unit,
+    onSelectPianoOnly: () -> Unit,
     onSelectMic: () -> Unit,
-    onSelectDemo: () -> Unit,
     onToggleVampHold: () -> Unit
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = StageColors.DeepSlate,
-        border = BorderStroke(1.dp, StageColors.Hairline)
+        border = BorderStroke(0.8.dp, StageColors.Hairline)
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Primary Play / Stop Button
-            Button(
-                onClick = onToggleJam,
-                modifier = Modifier
-                    .weight(1.25f)
-                    .height(48.dp),
-                shape = RoundedCornerShape(14.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isRunning) StageColors.Coral else StageColors.Gold,
-                    contentColor = StageColors.Obsidian
-                )
-            ) {
-                Icon(
-                    imageVector = if (isRunning) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
-                    contentDescription = null
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = if (isRunning) "עצור ג'אם" else "נגן ליווי",
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize = 14.sp
-                )
-            }
-
-            // Input Mode Segmented Pill (Mic vs Demo)
-            Surface(
-                modifier = Modifier
-                    .weight(1.1f)
-                    .height(48.dp),
-                shape = RoundedCornerShape(14.dp),
-                color = StageColors.Charcoal,
-                border = BorderStroke(1.dp, StageColors.Hairline)
-            ) {
+            // Timecode + Progress Strip (LTR)
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Row(
-                    modifier = Modifier.fillMaxSize().padding(3.dp),
-                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    val isMic = inputMode == InputMode.MIC
-                    Box(
+                    Text(
+                        text = formatSec(refTimeSec),
+                        color = StageColors.TextSecondary,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    LinearProgressIndicator(
+                        progress = { (progressPct / 100f).coerceIn(0f, 1f) },
                         modifier = Modifier
                             .weight(1f)
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (isMic) StageColors.Cyan.copy(alpha = 0.22f) else StageColors.Charcoal)
-                            .clickable { onSelectMic() },
-                        contentAlignment = Alignment.Center
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(999.dp)),
+                        color = StageColors.Gold,
+                        trackColor = StageColors.Elevated
+                    )
+                    Text(
+                        text = formatSec(durationSec),
+                        color = StageColors.TextMuted,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    IconButton(
+                        onClick = onResetToStart,
+                        modifier = Modifier.size(24.dp)
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Rounded.Mic,
-                                contentDescription = null,
-                                tint = if (isMic) StageColors.Cyan else StageColors.TextMuted,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text(
-                                text = "מיק'",
-                                color = if (isMic) StageColors.Cyan else StageColors.TextMuted,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (!isMic) StageColors.Gold.copy(alpha = 0.22f) else StageColors.Charcoal)
-                            .clickable { onSelectDemo() },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Rounded.GraphicEq,
-                                contentDescription = null,
-                                tint = if (!isMic) StageColors.Gold else StageColors.TextMuted,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text(
-                                text = "דמו",
-                                color = if (!isMic) StageColors.Gold else StageColors.TextMuted,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Rounded.Replay,
+                            contentDescription = "חזור להתחלה",
+                            tint = StageColors.TextMuted,
+                            modifier = Modifier.size(15.dp)
+                        )
                     }
                 }
             }
 
-            // Hold Vamp Pad
-            Surface(
-                modifier = Modifier
-                    .weight(0.95f)
-                    .height(48.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .clickable { onToggleVampHold() },
-                shape = RoundedCornerShape(14.dp),
-                color = if (isVampHolding) StageColors.Coral.copy(alpha = 0.22f) else StageColors.Charcoal,
-                border = BorderStroke(
-                    width = if (isVampHolding) 1.5.dp else 1.dp,
-                    color = if (isVampHolding) StageColors.Coral else StageColors.Hairline
-                )
+            // Primary Controls Row: Play/Stop + 3-Way Audio Mode Selector + Vamp Hold
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxSize(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
+                // Play / Stop Button
+                Button(
+                    onClick = onToggleJam,
+                    modifier = Modifier
+                        .weight(1.1f)
+                        .height(46.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isRunning) StageColors.Coral else StageColors.Gold,
+                        contentColor = StageColors.Obsidian
+                    )
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Loop,
+                        imageVector = if (isRunning) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
                         contentDescription = null,
-                        tint = if (isVampHolding) StageColors.Coral else StageColors.TextSecondary,
-                        modifier = Modifier.size(17.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = if (isVampHolding) "VAMP!" else "עצור מעבר",
-                        color = if (isVampHolding) StageColors.Coral else StageColors.TextSecondary,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
+                        text = if (isRunning) "עצור" else "נגן",
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 14.sp
                     )
+                }
+
+                // 3-Way Non-Clashing Mode Selector: [פסנתר כנף] [שיר מקורי] [מיקרופון]
+                Surface(
+                    modifier = Modifier
+                        .weight(2.15f)
+                        .height(46.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    color = StageColors.Charcoal,
+                    border = BorderStroke(0.8.dp, StageColors.Hairline)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        val isMic = inputMode == InputMode.MIC
+                        val isPianoOnly = !isMic && audioOutputMode == AudioOutputMode.PIANO_ONLY
+                        val isOriginal = !isMic && audioOutputMode != AudioOutputMode.PIANO_ONLY
+
+                        // 1. Acoustic Grand Piano Accompaniment Mode
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isPianoOnly) StageColors.Gold.copy(alpha = 0.22f)
+                                    else StageColors.Charcoal
+                                )
+                                .clickable { onSelectPianoOnly() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Piano,
+                                    contentDescription = null,
+                                    tint = if (isPianoOnly) StageColors.Gold else StageColors.TextMuted,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = "פסנתר",
+                                    color = if (isPianoOnly) StageColors.Gold else StageColors.TextMuted,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        // 2. Original Audio Track Mode (100% clean MP3, zero synth clashing)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isOriginal) StageColors.Emerald.copy(alpha = 0.22f)
+                                    else StageColors.Charcoal
+                                )
+                                .clickable { onSelectOriginalTrack() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Headphones,
+                                    contentDescription = null,
+                                    tint = if (isOriginal) StageColors.Emerald
+                                    else if (hasOriginalAudio) StageColors.TextSecondary
+                                    else StageColors.TextMuted,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = if (hasOriginalAudio) "מקור" else "+MP3",
+                                    color = if (isOriginal) StageColors.Emerald
+                                    else if (hasOriginalAudio) StageColors.TextSecondary
+                                    else StageColors.TextMuted,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        // 3. Live Microphone Accompaniment Mode
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isMic) StageColors.Cyan.copy(alpha = 0.22f)
+                                    else StageColors.Charcoal
+                                )
+                                .clickable { onSelectMic() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Mic,
+                                    contentDescription = null,
+                                    tint = if (isMic) StageColors.Cyan else StageColors.TextMuted,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = "מיק'",
+                                    color = if (isMic) StageColors.Cyan else StageColors.TextMuted,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Hold Vamp Pad
+                Surface(
+                    modifier = Modifier
+                        .weight(0.75f)
+                        .height(46.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .clickable { onToggleVampHold() },
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (isVampHolding) StageColors.Coral.copy(alpha = 0.22f) else StageColors.Charcoal,
+                    border = BorderStroke(
+                        width = if (isVampHolding) 1.5.dp else 0.8.dp,
+                        color = if (isVampHolding) StageColors.Coral else StageColors.Hairline
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Loop,
+                            contentDescription = null,
+                            tint = if (isVampHolding) StageColors.Coral else StageColors.TextSecondary,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(
+                            text = "לופ",
+                            color = if (isVampHolding) StageColors.Coral else StageColors.TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
         }
@@ -616,13 +715,14 @@ private fun StudioSettingsSheet(
     reverbMix: Float,
     confidenceThreshold: Float,
     simSpeed: Float,
-    hearSinger: Boolean,
+    audioOutputMode: AudioOutputMode,
+    hasOriginalAudio: Boolean,
     onSelectStyle: (AccompanimentStyle) -> Unit,
     onToggleDrums: (Boolean) -> Unit,
     onReverbChange: (Float) -> Unit,
     onConfidenceChange: (Float) -> Unit,
     onSimSpeedChange: (Float) -> Unit,
-    onToggleHearSinger: (Boolean) -> Unit,
+    onSelectAudioOutputMode: (AudioOutputMode) -> Unit,
     onExportMidi: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onDismiss: () -> Unit
@@ -643,15 +743,57 @@ private fun StudioSettingsSheet(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "קונסולת ליווי ואפקטים",
+                text = "קונסולת סאונד וליווי פסנתר כנף",
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
                 color = StageColors.TextPrimary
             )
 
-            // Style cards
+            if (hasOriginalAudio) {
+                Text(
+                    text = "מצב שמע (ללא התנגשות בין MP3 לפסנתר)",
+                    fontSize = 12.sp,
+                    color = StageColors.TextMuted
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    AudioOutputMode.entries.forEach { mode ->
+                        val selected = mode == audioOutputMode
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onSelectAudioOutputMode(mode) },
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (selected) StageColors.Emerald.copy(alpha = 0.16f) else StageColors.Charcoal,
+                            border = BorderStroke(
+                                if (selected) 1.5.dp else 1.dp,
+                                if (selected) StageColors.Emerald else StageColors.Hairline
+                            )
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(
+                                    text = mode.labelHe,
+                                    color = if (selected) StageColors.Emerald else StageColors.TextPrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = mode.subtitleHe,
+                                    color = StageColors.TextMuted,
+                                    fontSize = 9.sp,
+                                    maxLines = 2
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
             Text(
-                text = "סגנון נגינה (Voice-Leading)",
+                text = "סגנון נגינת הפסנתר (Voice-Leading)",
                 fontSize = 12.sp,
                 color = StageColors.TextMuted
             )
@@ -692,33 +834,26 @@ private fun StudioSettingsSheet(
 
             HorizontalDivider(color = StageColors.Hairline)
 
-            // Switches
             SettingSwitchRow(
-                label = "תופים מינימליסטיים (קיק / ריים / מברשות)",
+                label = "הוסף פעימת תופים עדינה (כבוי כברירת מחדל בבלדות פסנתר)",
                 checked = includeDrums,
                 onCheckedChange = onToggleDrums
             )
-            SettingSwitchRow(
-                label = "נגן אודיו מקורי של השיר (בקובץ שיובא מהמכשיר)",
-                checked = hearSinger,
-                onCheckedChange = onToggleHearSinger
-            )
 
-            // Sliders
             SettingSliderRow(
-                label = "חלל Reverb: ${(reverbMix * 100).toInt()}%",
+                label = "הדהוד אולם קונצרטים (Reverb): ${(reverbMix * 100).toInt()}%",
                 value = reverbMix,
                 range = 0f..0.85f,
                 onValueChange = onReverbChange
             )
             SettingSliderRow(
-                label = "רגישות מעבר אקורד: ${(confidenceThreshold * 100).toInt()}%",
+                label = "רגישות מעבר אקורד (במצב מיקרופון): ${(confidenceThreshold * 100).toInt()}%",
                 value = confidenceThreshold,
                 range = 0.30f..0.88f,
                 onValueChange = onConfidenceChange
             )
             SettingSliderRow(
-                label = "מהירות נגינה (מצב דמו/אימון): x${"%.2f".format(simSpeed)}",
+                label = "מהירות נגינה / אימון: x${"%.2f".format(simSpeed)}",
                 value = simSpeed,
                 range = 0.65f..1.45f,
                 onValueChange = onSimSpeedChange
@@ -793,7 +928,9 @@ private fun SettingSwitchRow(
             text = label,
             color = StageColors.TextSecondary,
             fontSize = 13.sp,
-            modifier = Modifier.weight(1f).padding(end = 12.dp)
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 12.dp)
         )
         Switch(
             checked = checked,
@@ -802,7 +939,7 @@ private fun SettingSwitchRow(
                 checkedThumbColor = StageColors.Obsidian,
                 checkedTrackColor = StageColors.Gold,
                 uncheckedThumbColor = StageColors.TextMuted,
-                uncheckedTrackColor = StageColors.Elevated
+                uncheckedTrackColor = StageColors.Charcoal
             )
         )
     }
@@ -815,8 +952,12 @@ private fun SettingSliderRow(
     range: ClosedFloatingPointRange<Float>,
     onValueChange: (Float) -> Unit
 ) {
-    Column {
-        Text(text = label, color = StageColors.TextSecondary, fontSize = 12.sp)
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = label,
+            color = StageColors.TextSecondary,
+            fontSize = 12.sp
+        )
         Slider(
             value = value,
             onValueChange = onValueChange,
