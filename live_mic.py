@@ -66,8 +66,6 @@ def run_live_mic(
         print(f"{RED}[!] PortAudio / sounddevice is not available in this environment: {e}{RESET}")
         print("    For headless testing without a microphone, use:")
         print(f"    {CYAN}python3 simulate.py -m {song_map_path}{RESET}")
-        print("    Or launch the browser Web Studio:")
-        print(f"    {CYAN}python3 server.py{RESET}")
         sys.exit(1)
 
     with open(song_map_path, "r", encoding="utf-8") as f:

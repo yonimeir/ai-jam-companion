@@ -1,0 +1,27 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer subtle amber/cyan harmonic halo -->
+    <path
+        android:pathData="M54,18 A36,36 0 1,1 53.99,18 Z"
+        android:strokeWidth="2.5"
+        android:strokeColor="#38BDF8"
+        android:fillColor="#00000000" />
+    <!-- Stylized Grand Piano Key Motif -->
+    <path
+        android:pathData="M31,36 L77,36 C79.2,36 81,37.8 81,40 L81,68 C81,70.2 79.2,72 77,72 L31,72 C28.8,72 27,70.2 27,68 L27,40 C27,37.8 28.8,36 31,36 Z"
+        android:fillColor="#F8FAFC" />
+    <!-- Black keys -->
+    <path android:pathData="M38,36 L44,36 L44,57 L38,57 Z" android:fillColor="#0B1120" />
+    <path android:pathData="M51,36 L57,36 L57,57 L51,57 Z" android:fillColor="#0B1120" />
+    <path android:pathData="M64,36 L70,36 L70,57 L64,57 Z" android:fillColor="#0B1120" />
+    <!-- Warm gold soundwave pulse at bottom -->
+    <path
+        android:pathData="M32,82 Q43,75 54,82 T76,82"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:strokeColor="#F5B041"
+        android:fillColor="#00000000" />
+</vector>

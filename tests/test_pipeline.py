@@ -5,7 +5,6 @@ Validates all stages end-to-end:
 - Stage B: Vectorized FFT-YIN real-time pitch detection, Online DTW score following
 - Stage C: Harmonic State Machine, confidence threshold, Vamp loop logic
 - Stage D: Dynamic velocity mapping, smooth voice-leading, minimalist drums, MIDI & WAV synthesis
-- Backend API: FastAPI routes and WebSocket real-time streaming
 """
 
 import json
@@ -18,9 +17,7 @@ import numpy as np
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from offline_pipeline.chord_detector import (
-    create_chord_templates, chord_to_midi_notes, extract_chords_from_audio
-)
+from offline_pipeline.chord_detector import create_chord_templates, chord_to_midi_notes
 from realtime_engine.pitch_detector import RealtimePitchDetector
 from realtime_engine.harmonic_state_machine import HarmonicStateMachine, EngineState
 from realtime_engine.tracker import RealtimeJamTracker
@@ -139,124 +136,6 @@ class TestJamCompanionPipeline(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
             tracker.midi_builder.export_midi(tmp.name)
             self.assertGreater(os.path.getsize(tmp.name), 100)
-
-    def test_fastapi_server_routes_and_websocket(self):
-        from fastapi.testclient import TestClient
-        import server
-
-        client = TestClient(server.app)
-        res = client.get("/api/health")
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()["status"], "ok")
-
-        res_map = client.get("/api/song-map/current")
-        self.assertEqual(res_map.status_code, 200)
-        self.assertIn("states", res_map.json())
-
-        # Test WebSocket real-time streaming
-        with client.websocket_connect("/ws/jam") as ws:
-            ws.send_json({"type": "config", "style": "ballad", "drums": True})
-            pcm = (0.5 * np.sin(2 * np.pi * 440.0 * np.linspace(0, 0.1, 2205))).astype(np.float32)
-            ws.send_bytes(pcm.tobytes())
-            msg = ws.receive_json()
-            self.assertEqual(msg["type"], "state")
-            self.assertIn("chord", msg["data"])
-
-    def test_youtube_url_extraction_and_share_target(self):
-        from unittest.mock import patch
-        from fastapi.testclient import TestClient
-        from offline_pipeline.extract_song_map import extract_media_url
-        import server
-
-        self.assertEqual(
-            extract_media_url("Check out this track https://youtu.be/dQw4w9WgXcQ?si=xyz123!"),
-            "https://youtu.be/dQw4w9WgXcQ?si=xyz123",
-        )
-        self.assertEqual(
-            extract_media_url("https://music.youtube.com/watch?v=abcDEF12345&list=RDAMVM"),
-            "https://music.youtube.com/watch?v=abcDEF12345&list=RDAMVM",
-        )
-        self.assertEqual(
-            extract_media_url("https://www.youtube.com/shorts/9bZkp7q19f0"),
-            "https://www.youtube.com/shorts/9bZkp7q19f0",
-        )
-        self.assertIsNone(extract_media_url("just some plain text without a link"))
-
-        client = TestClient(server.app)
-
-        # PWA Manifest & Service Worker & Icons
-        manifest_res = client.get("/manifest.json")
-        self.assertEqual(manifest_res.status_code, 200)
-        manifest = manifest_res.json()
-        self.assertEqual(manifest["share_target"]["action"], "/share")
-        self.assertEqual(manifest["share_target"]["params"]["url"], "url")
-        self.assertEqual(manifest["share_target"]["params"]["text"], "text")
-
-        self.assertEqual(client.get("/sw.js").status_code, 200)
-        self.assertEqual(client.get("/icon.svg").status_code, 200)
-        self.assertEqual(client.get("/icon-192.png").status_code, 200)
-        self.assertEqual(client.get("/api/audio/active-vocals").status_code, 200)
-
-        # Web Share Target redirect (Android YouTube sends URL inside `text`)
-        share_res = client.get(
-            "/share",
-            params={"text": "Amazing ballad https://youtu.be/abc12345?si=999", "title": "My YouTube Song"},
-            follow_redirects=False,
-        )
-        self.assertEqual(share_res.status_code, 302)
-        loc = share_res.headers["location"]
-        self.assertIn("url=https%3A%2F%2Fyoutu.be%2Fabc12345%3Fsi%3D999", loc)
-        self.assertIn("title=My+YouTube+Song", loc)
-
-        # Validation on invalid URL
-        bad_res = client.post("/api/analyze-url", json={"url": "not-a-valid-url"})
-        self.assertEqual(bad_res.status_code, 400)
-
-        # Mocked YouTube download using local demo audio to verify full pipeline integration
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        demo_wav = os.path.join(base, "audio_samples", "demo_ballad_full.wav")
-        if os.path.exists(demo_wav):
-            def fake_dl(url, output_dir):
-                return demo_wav, {
-                    "title": "Mocked YouTube Ballad",
-                    "artist": "YouTube Creator",
-                    "source_url": url,
-                    "video_id": "abc12345",
-                }
-
-            with patch("offline_pipeline.extract_song_map.download_audio_with_metadata", side_effect=fake_dl):
-                ok_res = client.post(
-                    "/api/analyze-url",
-                    json={"url": "Share link https://youtu.be/abc12345"},
-                )
-            self.assertEqual(ok_res.status_code, 200)
-            body = ok_res.json()
-            self.assertEqual(body["metadata"]["title"], "Mocked YouTube Ballad")
-            self.assertEqual(body["metadata"]["artist"], "YouTube Creator")
-            self.assertEqual(body["metadata"]["source_url"], "https://youtu.be/abc12345")
-            self.assertGreater(len(body["states"]), 0)
-
-            # Verify async job submission & status polling
-            import time
-            with patch("offline_pipeline.extract_song_map.download_audio_with_metadata", side_effect=fake_dl):
-                async_res = client.post(
-                    "/api/analyze-url-async",
-                    json={"url": "https://youtu.be/abc12345"},
-                )
-                self.assertEqual(async_res.status_code, 200)
-                job_id = async_res.json()["job_id"]
-                final_payload = None
-                for _ in range(100):
-                    st = client.get(f"/api/analyze/status/{job_id}")
-                    self.assertEqual(st.status_code, 200)
-                    data = st.json()
-                    if data["status"] in ("done", "error"):
-                        final_payload = data
-                        break
-                    time.sleep(0.05)
-                self.assertIsNotNone(final_payload)
-                self.assertEqual(final_payload["status"], "done")
-                self.assertEqual(final_payload["song_map"]["metadata"]["title"], "Mocked YouTube Ballad")
 
 
 if __name__ == "__main__":
